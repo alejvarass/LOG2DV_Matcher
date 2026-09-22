@@ -1,22 +1,45 @@
 """
 Lith_main.py – Analizador Litológico de Patrones
 ================================================
-Pipeline híbrido estable y limpio:
-  - Sin persistencia JSON
-  - Exportación a CSV, MySQL y PostgreSQL
-  - Desempates litológicos deterministas integrados
+Pipeline híbrido de análisis litológico:
+
+  1. Segmentación de casillas (contornos + filtros geométricos).
+  2. OCR multi-estrategia (EasyOCR) con fuzzy matching geológico contra geo_lith.csv.
+  3. Clasificación visual multi-métrica:
+       - Color LAB continuo
+       - Histogramas BGR + HSV (con penalización de anti-correlación)
+       - NCC estructural + gradientes Sobel
+       - Bordes Laplaciano
+       - Textura ILBP (LBP invariante a rotación) + estadísticas de Haralick (GLCM)
+       - Keypoints ORB con ratio test de Lowe
+       - Embeddings DINOv2 (IA) multi-crop con caché en disco
+  4. Desempate litológico ponderado por la confianza del OCR.
+  5. Exportación a CSV, MySQL y PostgreSQL.
+
+El detalle completo del método está documentado en ANALISIS.md.
 """
 
 import sys
 import os
 import csv
+import hashlib
+import unicodedata
 import cv2
 import numpy as np
 import easyocr
-import torch
-import torchvision.transforms as transforms
 from PIL import Image
 from difflib import get_close_matches, SequenceMatcher
+
+# --- Dependencias de IA (opcionales): si torch/DINOv2 no están disponibles, ---
+# --- el sistema sigue funcionando solo con las métricas clásicas de OpenCV.  ---
+try:
+    import torch
+    import torchvision.transforms as transforms
+    TORCH_AVAILABLE = True
+except Exception:  # torch no instalado o incompatible
+    torch = None
+    transforms = None
+    TORCH_AVAILABLE = False
 
 from PySide6.QtCore import Qt, Signal, QThread, QSize
 from PySide6.QtGui import QPixmap, QImage, QIcon
@@ -32,6 +55,66 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV_PATH = os.path.join(BASE_DIR, "geo_lith.csv")
 DEFAULT_PATTERNS_DIR = os.path.join(BASE_DIR, "Patterns")
 PATTERN_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
+
+# ============================================================================
+# CONFIGURACIÓN DEL MOTOR DE COMPARACIÓN
+# ============================================================================
+
+# Pesos de cada métrica clásica dentro del score visual (suman 1.0).
+# La textura (LBP-ri + distancia + grosor + orientación + GLCM) es la más
+# fiable para tramas geológicas, por eso tiene el mayor peso. La estructura
+# NCC queda limitada porque es sensible a la correlación espuria entre
+# tramas periódicas (una retícula correlaciona alta con líneas). Los pesos
+# se renormalizan según las métricas disponibles en cada comparación.
+W_COLOR, W_HIST, W_STRUCT, W_EDGES, W_TEXTURE, W_ORB = 0.10, 0.07, 0.06, 0.07, 0.48, 0.22
+
+# Peso de la IA (DINOv2) frente a las métricas clásicas cuando está disponible.
+DINO_WEIGHT = 0.30  # 30% IA + 70% métricas clásicas
+
+# Intensidad máxima del ajuste litológico (desempate) en puntos de score.
+# El ajuste real se escala por la confianza del OCR (0..1), así un OCR
+# dudoso no fuerza desempates equivocados (esto causaba fallos en patrones básicos).
+TIE_BREAK_STRENGTH = 3.5
+
+# Tabla de afinidades litología -> patrón para el desempate fino.
+# Claves: idLith del catálogo geo_lith. Valores: {basename_patron: ajuste}.
+LITHOLOGY_AFFINITIES = {
+    8:  {"12": +1.0, "4-8": -1.0},    # ARCILITA TOBACEA
+    21: {"18": +1.0, "7-3": +1.0, "5-2": -1.0},  # DOLOMITA
+    5:  {"5": +1.0, "5-4": -1.0},     # ARENISCA CALCAREA
+    38: {"17": +1.0, "15": -1.0, "5-2": -1.0},   # CALIZA ARCILLOSA
+}
+
+# Stopwords geológicas: no aportan discriminación al fuzzy matching de nombres.
+_GEO_STOPWORDS = {"DE", "LA", "EL", "Y", "CON", "DEL", "EN"}
+
+# Correcciones fonéticas/ortográficas frecuentes del OCR en español geológico.
+# Forma: (fragmento_erróneo, fragmento_correcto). Se aplican sobre tokens.
+_TOKEN_FIXES = (
+    ("LIM0", "LIMO"), ("ARC1", "ARCI"), ("CALC", "CALC"),
+    ("4RE", "ARE"), ("AR3N", "AREN"), ("T0B", "TOB"),
+    ("D0L", "DOL"), ("C0NGL", "CONGL"), ("GRAU", "GRAV"),
+)
+
+def _normalize_geo_text(text):
+    """
+    Normaliza texto geológico para comparación robusta:
+      - Mayúsculas, sin acentos (NFKD), solo caracteres alfanuméricos.
+      - Separa en tokens y elimina stopwords.
+    """
+    if not text:
+        return []
+    txt = unicodedata.normalize("NFKD", text.upper())
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    txt = "".join(ch if (ch.isalnum() or ch == " ") else " " for ch in txt)
+    return [t for t in txt.split() if t and t not in _GEO_STOPWORDS]
+
+def _fix_token(tok):
+    """Aplica correcciones fonéticas/números->letras típicas del OCR."""
+    for wrong, right in _TOKEN_FIXES:
+        if wrong in tok:
+            tok = tok.replace(wrong, right)
+    return tok
 
 DARK_STYLE = """
 QMainWindow, QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', sans-serif; }
@@ -85,36 +168,398 @@ def load_geo_lith_csv(path):
     return records
 
 def match_lith_name(ocr_text, geo_lith_records):
+    """
+    Hace coincidir el texto OCR con el catálogo geo_lith.
+
+    Devuelve (idLith, nombre_catalogo, confianza) donde confianza ∈ [0, 1]:
+      1.00 = coincidencia exacta (tras normalización)
+      0.90 = todos los tokens del catálogo presentes en el OCR
+      0.70+ = fuzzy matching por tokens (con correcciones fonéticas)
+      0.40  = fuzzy matching de cadena completa
+      0.00  = sin coincidencia (idLith = -1)
+
+    La confianza se usa después para escalar el desempate litológico:
+    un OCR poco fiable apenas influye en la decisión visual.
+    """
     if not geo_lith_records or not ocr_text.strip():
-        return -1, ocr_text
+        return -1, ocr_text, 0.0
+
     upper = ocr_text.upper().strip()
     names = [r["nombre"].upper().strip() for r in geo_lith_records]
+
+    # --- 1) Coincidencia exacta de cadena completa ---
     if upper in names:
         idx = names.index(upper)
-        return geo_lith_records[idx]["idLith"], geo_lith_records[idx]["nombre"]
-    matches = get_close_matches(upper, names, n=1, cutoff=0.40)
+        return geo_lith_records[idx]["idLith"], geo_lith_records[idx]["nombre"], 1.0
+
+    ocr_tokens = [_fix_token(t) for t in _normalize_geo_text(ocr_text)]
+    cat_tokens_list = [[_fix_token(t) for t in _normalize_geo_text(n)] for n in names]
+
+    # --- 2) Coincidencia exacta por conjunto de tokens.                  ---
+    # Solo cuando el OCR tiene >=2 tokens: con un solo token, nombres del
+    # catálogo más largos pero distintos ganarían por subconjunto
+    # ("ARCILITA TOB." -> ARCILITA); esos casos los resuelve el paso 3.
+    if ocr_tokens and len(ocr_tokens) >= 2:
+        ocr_set = set(ocr_tokens)
+        best2, best2_idx = -1, -1
+        for i, toks in enumerate(cat_tokens_list):
+            # Todos los tokens del nombre deben estar en el OCR y el nombre
+            # debe ser AL MENOS tan específico como el OCR (si el OCR tiene
+            # más tokens que el nombre, puede ser una abreviatura, p.ej.
+            # "ARCILITA TOB." -> ARCILITA TOBACEA: lo resuelve el paso 3).
+            if toks and set(toks).issubset(ocr_set) and len(toks) >= len(ocr_tokens) and len(toks) > best2:
+                best2, best2_idx = len(toks), i   # gana el más específico
+        if best2_idx >= 0:
+            return geo_lith_records[best2_idx]["idLith"], geo_lith_records[best2_idx]["nombre"], 0.90
+
+    # --- 3) Matching por tokens unificado ---------------------------------
+    # Para cada nombre del catálogo se calcula:
+    #   hits  = tokens del OCR explicados (exacto, fuzzy >=0.75 o
+    #           abreviatura-prefijo como "TOB" -> "TOBACEA")
+    #   cov_ocr = hits / tokens del OCR
+    #   cov_cat = tokens distintos del nombre alcanzados / total del nombre
+    # Solo se acepta un nombre si TODO el texto OCR queda explicado
+    # (cov_ocr = 1) y además el nombre queda totalmente cubierto o hay >=2
+    # coincidencias fuertes. Esto evita falsos positivos clásicos:
+    #   "ARENA"        -> ARENI / TOBA ARENOSA   (cov insuficiente: -1)
+    #   "ARCILITA TOB."-> ARCILITA TOBACEA       (cubre los 2 tokens)
+    # El ranking prefiere: más hits, luego mayor cobertura del nombre,
+    # luego mayor calidad media de coincidencia, luego nombre más largo.
+    def _token_score(ot, t):
+        r = SequenceMatcher(None, t, ot).ratio()
+        if ot == t:
+            return 1.0
+        # Abreviatura: SOLO si el token OCR es el prefijo Y es claramente
+        # más corto (>=3 letras) que el del catálogo ("TOB"->TOBACEA).
+        # Si las longitudes son casi iguales ("ARENA" vs "AREN") no es una
+        # abreviatura: son palabras distintas y caerá al fuzzy con guardia.
+        if len(ot) >= 3 and len(t) >= len(ot) + 3 and t.startswith(ot):
+            return max(r, 0.80)
+        if len(ot) >= 3 and len(t) >= 3 and r >= 0.75:
+            # Guardia de especificidad: un token corto (<=5 letras) es
+            # peligroso, porque el fuzzy lo confunde con cualquier palabra
+            # que lo contenga ("ARENA" vs "AREN"/"ARENI"). Solo pasa si el
+            # ratio es casi exacto. Si difieren mucho en longitud, igual.
+            if (min(len(ot), len(t)) <= 5 or abs(len(t) - len(ot)) >= 2) and r < 0.92:
+                return r * 0.4           # queda < 0.75, no cuenta como hit
+            return r                     # fuzzy fuerte
+        return r
+
+    if ocr_tokens:
+        best_key, best_tok_idx = None, -1
+        for i, toks in enumerate(cat_tokens_list):
+            if not toks:
+                continue
+            matched_cat = set()
+            per_ocr = []
+            for ot in ocr_tokens:
+                best_j, best_r = -1, 0.0
+                for j, t in enumerate(toks):
+                    r = _token_score(ot, t)
+                    # La guardia de especificidad marca palabras distintas
+                    # ("ARENA" vs "AREN") devolviendo < 0.75: nunca ganan.
+                    if r > best_r:
+                        best_r, best_j = r, j
+                per_ocr.append(best_r)
+                if best_j >= 0 and best_r >= 0.75:
+                    matched_cat.add(best_j)
+            hits = sum(1 for r in per_ocr if r >= 0.75)
+            cov_ocr = hits / len(ocr_tokens)
+            cov_cat = len(matched_cat) / len(toks)
+            if cov_ocr >= 0.99 and hits >= 1 and (cov_cat >= 0.99 or hits >= 2):
+                quality = sum(per_ocr) / len(per_ocr)
+                key = (hits, cov_cat, quality, len(toks))
+                if best_key is None or key > best_key:
+                    best_key, best_tok_idx = key, i
+        if best_tok_idx >= 0:
+            quality = best_key[2]
+            return (geo_lith_records[best_tok_idx]["idLith"],
+                    geo_lith_records[best_tok_idx]["nombre"],
+                    float(min(0.88, max(0.60, quality))))
+
+    # --- 5) Subcadena: solo si el texto OCR es largo (>=6), la cadena ----
+    # --- corta cubre casi toda la larga Y el match cae en límites de ----
+    # --- palabra (evita que "ARENA" active "AREN" o "ARENOSA").       ---
+    if len(upper) >= 6:
+        for i, n in enumerate(names):
+            if not n:
+                continue
+            if n in upper or upper in n:
+                short, long_ = (upper, n) if len(upper) <= len(n) else (n, upper)
+                if len(short) / len(long_) < 0.80:
+                    continue
+                # límites de palabra: la subcadena no puede cortar tokens
+                pos = long_.find(short)
+                end = pos + len(short)
+                ok_start = pos == 0 or not long_[pos - 1].isalnum()
+                ok_end = end >= len(long_) or not long_[end].isalnum()
+                if ok_start and ok_end:
+                    return geo_lith_records[i]["idLith"], geo_lith_records[i]["nombre"], 0.50
+
+    # --- 6) Fuzzy clásico de cadena completa (difflib), umbral alto para ---
+    # --- no asignar litologías a texto que claramente no es geológico.   ---
+    # Se exige además que la longitud no difiera demasiado (evita que
+    # "ARENA" (5) case con "AREN" (4) por ratio 0.889).
+    matches = get_close_matches(upper, names, n=1, cutoff=0.65)
     if matches:
         idx = names.index(matches[0])
-        return geo_lith_records[idx]["idLith"], geo_lith_records[idx]["nombre"]
+        n = names[idx]
+        # Guardia: para nombres cortos (<6 letras) exige igualdad de
+        # longitud, porque el fuzzy los confunde con facilidad ("ARENA"
+        # casa con "AREN" por ratio 0.889 si solo se exige ±1).
+        if min(len(upper), len(n)) >= 6 or len(upper) == len(n):
+            return geo_lith_records[idx]["idLith"], geo_lith_records[idx]["nombre"], 0.45
+
+    # --- 7) Último recurso: ratio de SequenceMatcher con umbral exigente ---
+    best_score, best_idx = 0.0, -1
     for i, n in enumerate(names):
-        if n and (n in upper or upper in n):
-            return geo_lith_records[i]["idLith"], geo_lith_records[i]["nombre"]
-    best_score, best_idx = 0, -1
-    for i, n in enumerate(names):
-        if not n: continue
+        if not n:
+            continue
         s = SequenceMatcher(None, upper, n).ratio()
         if s > best_score:
-            best_score = s
-            best_idx = i
-    if best_score >= 0.30 and best_idx >= 0:
-        return geo_lith_records[best_idx]["idLith"], geo_lith_records[best_idx]["nombre"]
-    return -1, ocr_text
+            best_score, best_idx = s, i
+    if best_score >= 0.55 and best_idx >= 0:
+        n = names[best_idx]
+        if min(len(upper), len(n)) >= 6 or len(upper) == len(n):
+            return geo_lith_records[best_idx]["idLith"], geo_lith_records[best_idx]["nombre"], best_score * 0.6
 
-def _combined_image_score(patch_bgr, target_bgr):
-    if patch_bgr is None or target_bgr is None: 
+    return -1, ocr_text, 0.0
+
+def _geology_from_name(name_clean, id_val, geo_lith_records):
+    """
+    Devuelve una clave geológica normalizada para el desempate litológico,
+    resolviendo cualquier combinación id / nombre / sinónimo en UN solo lugar:
+
+      - Primero por idLith directo (si está en la tabla de afinidades).
+      - Luego por tokens del nombre: busca el término geológico principal
+        (DOLOMITA, TOBA, ARENISCA, CALIZA, ARCILITA...) con fuzzy matching,
+        de modo que "ARCILITA TOBACEA" y "ARCILITA TOB." llegan al mismo
+        grupo aunque el OCR haya elegido nombres distintos.
+    """
+    if id_val in LITHOLOGY_AFFINITIES:
+        return id_val
+    toks = _normalize_geo_text(name_clean)
+    toks = [_fix_token(t) for t in toks]
+    def _has(word):
+        return any(t == word or (len(t) >= 3 and word.startswith(t)) or
+                   (len(t) >= 4 and SequenceMatcher(None, t, word).ratio() >= 0.80)
+                   for t in toks)
+    if _has("DOLOMITA"):
+        return 21
+    if _has("ARCILITA") and _has("TOBACEA"):
+        return 8
+    if _has("ARENISCA") and _has("CALCAREA"):
+        return 5
+    if _has("CALIZA") and (_has("ARCILLOSA") or _has("ARCILLITA")):
+        return 38
+    return None
+
+# ---------------------------------------------------------------------------
+# Métricas individuales de comparación de imágenes
+# ---------------------------------------------------------------------------
+
+def _texture_features(gray_f32):
+    """
+    Extrae un vector de textura discriminativo:
+      - LBP-ri: Local Binary Pattern crudo invariante a rotación
+        (36 bins) — separa puntos, líneas, cruces y bordes sin depender
+        de la orientación de la trama. NO se usa la variante "uniforme"
+        porque colapsa tramas distintas al mismo perfil de densidad.
+      - Estadísticas de la GLCM (contraste, energía, homogeneidad y
+        correlación) calculadas sobre la imagen cuantizada a 8 niveles
+        en 2 direcciones (0° y 90°). Son mucho más discriminativas que
+        la co-ocurrencia del LBP.
+    Todos los sub-vectores se normalizan a norma 1 antes de concatenar,
+    para que ninguno domine la similitud de coseno final.
+    """
+    g = gray_f32
+    if g.shape[0] < 8 or g.shape[1] < 8:
+        return None
+    g8 = np.clip(g, 0, 255).astype(np.uint8)
+    # Suavizado leve: el LBP usa diferencias de signo, muy sensibles al
+    # ruido de escaneo en zonas planas y bordes anti-aliased.
+    g8 = cv2.GaussianBlur(g8, (3, 3), 0)
+    c = g8[1:-1, 1:-1].astype(np.int16)
+    # 8 vecinos del LBP en sentido horario con umbral de 2 niveles de gris:
+    # ignora micro-variaciones de contraste pero conserva los bordes reales.
+    codes = np.zeros_like(c, dtype=np.uint8)
+    offsets = [(-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1)]
+    for bit, (dy, dx) in enumerate(offsets):
+        nb = g8[1 + dy:g8.shape[0] - 1 + dy, 1 + dx:g8.shape[1] - 1 + dx].astype(np.int16)
+        codes |= ((nb >= c + 2).astype(np.uint8) << bit)
+
+    lut = np.zeros(256, dtype=np.uint8)
+    uniq = {}
+    for v in range(256):
+        b = format(v, "08b")
+        rot_min = min(int(b[i:] + b[:i], 2) for i in range(8))
+        if rot_min not in uniq:
+            uniq[rot_min] = len(uniq)
+        lut[v] = uniq[rot_min]
+    n_bins = len(uniq)  # 36
+    lbp = lut[codes]
+    hist = cv2.calcHist([lbp], [0], None, [n_bins], [0, n_bins]).flatten()
+    hist = hist / max(hist.sum(), 1e-6)
+    # Raíz cuadrada SUAVE: atenúa el bin dominante (fondo) sin destruir la
+    # señal de los bins de borde (que separan líneas de puntos).
+    hist = hist ** 0.75
+    hist /= max(np.linalg.norm(hist), 1e-6)
+
+    # --- Histograma de la transformada de distancia (grosor/espaciado) ---
+    # Mide a qué distancia está cada píxel del fondo respecto a la tinta:
+    # separa tramas densas de tramas con líneas aisladas (retícula vs
+    # líneas). Bins de rango FIJO (0..12 px) para que el histograma sea
+    # comparable entre parches de distinta densidad.
+    _, ink = cv2.threshold(g8, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dist = cv2.distanceTransform(255 - ink, cv2.DIST_L2, 3)
+    dhist = np.histogram(dist, bins=8, range=(0.0, 12.0))[0].astype(np.float64)
+    dhist = dhist / max(dhist.sum(), 1e-6)
+    dhist /= max(np.linalg.norm(dhist), 1e-6)
+
+    # --- Perfil de grosor de tinta multi-escala ---------------------------
+    # Ratios de supervivencia de la tinta tras erosiones progresivas.
+    # Se usan RATIOS (no fracciones absolutas) porque las tramas geológicas
+    # suelen saturar la erosión (casi todo sobrevive): los ratios conservan
+    # la diferencia entre retículas (las intersecciones aguantan) y líneas
+    # finas (desaparecen). Es lo que mejor separa "cross" de "hlines".
+    ink_frac = max(float((ink > 0).mean()), 1e-6)
+    eroded = ink
+    thick = []
+    for _ in range(3):
+        eroded = cv2.erode(eroded, np.ones((3, 3), np.uint8))
+        thick.append(float((eroded > 0).mean()) / ink_frac)
+    thick = np.asarray(thick, dtype=np.float64)
+    thick /= max(np.linalg.norm(thick), 1e-6)
+
+    # --- Orientación local dominante (histograma de 4 bins, SIN sqrt) ----
+    # Gradientes fuertes votan por su orientación (0°, 45°, 90°, 135°):
+    # la retícula tiene energía repartida entre 2 orientaciones, las
+    # líneas simples concentran casi todo en una. NO se aplica raíz:
+    # atenuaría precisamente la señal que distingue 1 de 2 orientaciones.
+    gx = cv2.Sobel(g8, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(g8, cv2.CV_32F, 0, 1)
+    mag = np.hypot(gx, gy)
+    ang = (np.degrees(np.arctan2(gy, gx)) + 180.0) % 180.0
+    thr = np.percentile(mag, 60) if mag.size else 0.0
+    mask = mag >= thr
+    oh = np.zeros(4, dtype=np.float64)
+    if mask.any():
+        bins = np.clip((ang[mask] / 45.0).astype(np.int32), 0, 3)
+        np.add.at(oh, bins, mag[mask])
+    oh = oh / max(oh.sum(), 1e-6)
+    oh /= max(np.linalg.norm(oh), 1e-6)
+
+    # --- Perfil de tinta por filas y columnas -----------------------------
+    # Proyección de la tinta sobre el eje X e Y (8 bins cada uno). Es la
+    # característica más directa para distinguir tramas periódicas:
+    #   - líneas horizontales: perfil de filas con picos, columnas plano
+    #   - líneas verticales:   al revés
+    #   - retícula:            picos en AMBAS proyecciones
+    ink_bin = (ink > 0).astype(np.float64)
+    hh, ww = ink_bin.shape
+    def _proj(v, n=8):
+        parts = np.array_split(v, n)
+        p = np.asarray([x.mean() for x in parts])
+        return p / max(p.sum(), 1e-6)
+    proj_rows = _proj(ink_bin.mean(axis=1))   # proyección vertical (filas)
+    proj_cols = _proj(ink_bin.mean(axis=0))   # proyección horizontal (cols)
+    proj = np.concatenate([proj_rows, proj_cols])
+    proj /= max(np.linalg.norm(proj), 1e-6)
+
+    # --- Simetría horizontal/vertical de la tinta -------------------------
+    # Fracción de tinta en cada mitad: una retícula es simétrica en ambas
+    # direcciones; líneas puras solo en una.
+    sym_h = abs(ink_bin[: hh // 2].mean() - ink_bin[hh - hh // 2:].mean())
+    sym_v = abs(ink_bin[:, : ww // 2].mean() - ink_bin[:, ww - ww // 2:].mean())
+    sym = np.asarray([1.0 - min(sym_h * 4, 1.0), 1.0 - min(sym_v * 4, 1.0)])
+    sym /= max(np.linalg.norm(sym), 1e-6)
+
+    # --- GLCM sobre imagen cuantizada (8 niveles), distancia 1, 0° y 90° ---
+    n_g = 8
+    q = (g8.astype(np.int32) * n_g // 256).astype(np.int32)
+    stats = []
+    for dy, dx in ((0, 1), (1, 0)):
+        if dy == 0:
+            a, b = q[:, :-1].ravel(), q[:, 1:].ravel()
+        else:
+            a, b = q[:-1, :].ravel(), q[1:, :].ravel()
+        gl = np.zeros((n_g, n_g), dtype=np.float64)
+        np.add.at(gl, (a, b), 1)
+        gl += gl.T                      # simétrica
+        if gl.sum() > 0:
+            gl /= gl.sum()
+        i_idx = np.arange(n_g).reshape(n_g, 1)
+        j_idx = np.arange(n_g).reshape(1, n_g)
+        contrast = float((gl * (i_idx - j_idx) ** 2).sum())
+        energy = float(np.sqrt((gl ** 2).sum()))       # raíz de la energía (ASM)
+        homogeneity = float((gl / (1.0 + np.abs(i_idx - j_idx))).sum())
+        mu_i = float((gl * i_idx).sum()); mu_j = float((gl * j_idx).sum())
+        sd_i = np.sqrt(float((gl * (i_idx - mu_i) ** 2).sum()))
+        sd_j = np.sqrt(float((gl * (j_idx - mu_j) ** 2).sum()))
+        corr = float((gl * (i_idx - mu_i) * (j_idx - mu_j)).sum() / (sd_i * sd_j + 1e-9))
+        stats += [contrast / n_g, energy, homogeneity, (corr + 1.0) / 2.0]
+    stats = np.asarray(stats, dtype=np.float64)
+    stats /= max(np.linalg.norm(stats), 1e-6)
+    return np.concatenate([hist, dhist, thick, oh, proj, sym, stats]).astype(np.float32)
+
+def _orb_match_score(patch_bgr, target_bgr, orb_cache):
+    """
+    Compara keypoints ORB con ratio test de Lowe (0.75).
+    Las tramas litológicas tienen poco gradiente, así que se aplica CLAHE
+    (ecualización adaptativa) y un FAST threshold bajo para que ORB
+    encuentre puntos incluso en tramas suaves.
+    Devuelve 0..100 según la fracción de descriptores del parche con
+    correspondencia fiable en el patrón.
+    """
+    key = id(target_bgr)
+    cached = orb_cache.get(key)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    g1 = clahe.apply(cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY))
+    g2 = clahe.apply(cv2.cvtColor(target_bgr, cv2.COLOR_BGR2GRAY))
+    if min(g1.shape[:2]) < 8 or min(g2.shape[:2]) < 8:
+        return 0.0
+    orb = cv2.ORB_create(nfeatures=150, fastThreshold=6, edgeThreshold=4, patchSize=16)
+    kp1, des1 = orb.detectAndCompute(g1, None)
+    if cached is None:
+        kp2, des2 = orb.detectAndCompute(g2, None)
+        orb_cache[key] = (kp2, des2)
+    else:
+        kp2, des2 = cached
+    if des1 is None or des2 is None or len(des1) == 0 or len(des2) == 0:
+        return 0.0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    good = 0
+    try:
+        for pair in bf.knnMatch(des1, des2, k=2):
+            if len(pair) == 2:
+                m, n = pair
+                if m.distance < 0.75 * n.distance:  # ratio test de Lowe
+                    good += 1
+    except cv2.error:
+        return 0.0
+    return min(100.0, (good / max(len(des1), 1)) * 200.0)
+
+def _combined_image_score(patch_bgr, target_bgr, orb_cache=None):
+    """
+    Score visual combinado (0..100 aprox.) entre un parche de casilla y un
+    patrón del catálogo, integrando 6 métricas complementarias:
+
+      1. Color LAB continuo ............ distancia euclidiana media por píxel
+      2. Histogramas BGR+HSV ........... correlación (con penalización de
+                                         anti-correlación, que antes se
+                                         truncaba a 0 y perdía información)
+      3. NCC estructural ............... correlación cruzada normalizada en
+                                         grises + sobre gradientes Sobel
+      4. Bordes Laplaciano ............. TM_CCOEFF_NORMED sobre Laplaciano
+      5. Textura ILBP + Haralick ....... distancia de coseno entre vectores
+      6. ORB (opcional) ................ keypoints con ratio test de Lowe
+
+    Los pesos se renormalizan según las métricas realmente disponibles.
+    """
+    if patch_bgr is None or target_bgr is None:
         return 0.0
     h, w = patch_bgr.shape[:2]
-    if h < 5 or w < 5: 
+    if h < 5 or w < 5:
         return 0.0
 
     target_resized = cv2.resize(target_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
@@ -127,7 +572,10 @@ def _combined_image_score(patch_bgr, target_bgr):
     score_color = max(0.0, 100.0 - mean_diff * 1.25)
 
     # 2. Histogramas en 6 canales (BGR + HSV)
-    score_hist = 0.0
+    #    Se conservan las correlaciones NEGATIVAS: indican patrones
+    #    claramente distintos y mejoran la discriminación entre tramas
+    #    con colores parecidos pero distribución diferente.
+    hist_vals = []
     for src, dst in (
         (patch_bgr, target_resized),
         (cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV), cv2.cvtColor(target_resized, cv2.COLOR_BGR2HSV))
@@ -137,32 +585,87 @@ def _combined_image_score(patch_bgr, target_bgr):
             h2 = cv2.calcHist([dst], [ch], None, [32], [0, 256])
             cv2.normalize(h1, h1)
             cv2.normalize(h2, h2)
-            score_hist += cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
-    score_hist = max(0.0, score_hist / 6.0) * 100.0
+            hist_vals.append(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
+    mean_corr = float(np.mean(hist_vals))
+    # Mapea [-1, 1] -> [0, 100] con leve énfasis en el extremo positivo
+    score_hist = max(0.0, (mean_corr + 0.15) / 1.15) * 100.0
 
-    # 3. Correlación Cruzada Normalizada (NCC)
+    # 3. NCC estructural: se evalúa sobre la imagen original y sobre el
+    #    mapa de gradientes Sobel. Además se prueba la inversión fotométrica
+    #    del objetivo (tinta clara/oscura intercambiada), porque los logs
+    #    escaneados a veces invierten el contraste de la trama.
     g1 = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     g2 = cv2.cvtColor(target_resized, cv2.COLOR_BGR2GRAY).astype(np.float32)
     g1_n = (g1 - g1.mean()) / max(g1.std(), 1e-5)
-    g2_n = (g2 - g2.mean()) / max(g2.std(), 1e-5)
-    ncc = float(np.mean(g1_n * g2_n))
-    score_struct = max(0.0, ncc) * 100.0
+    so1 = np.hypot(cv2.Sobel(g1, cv2.CV_32F, 1, 0), cv2.Sobel(g1, cv2.CV_32F, 0, 1))
+    so1_n = (so1 - so1.mean()) / max(so1.std(), 1e-5)
+    ncc = ncc_grad = -1.0
+    for cand in (g2, 255.0 - g2):
+        cand_n = (cand - cand.mean()) / max(cand.std(), 1e-5)
+        ncc = max(ncc, float(np.mean(g1_n * cand_n)))
+        so2 = np.hypot(cv2.Sobel(cand, cv2.CV_32F, 1, 0), cv2.Sobel(cand, cv2.CV_32F, 0, 1))
+        so2_n = (so2 - so2.mean()) / max(so2.std(), 1e-5)
+        ncc_grad = max(ncc_grad, float(np.mean(so1_n * so2_n)))
+    score_struct = max(0.0, ncc * 0.6 + ncc_grad * 0.4) * 100.0
 
-    # 4. Bordes con Laplaciano
+    # 4. Bordes con Laplaciano (también tolerante a inversión fotométrica)
     g1_blur = cv2.GaussianBlur(g1, (3, 3), 0)
     g2_blur = cv2.GaussianBlur(g2, (3, 3), 0)
+    g2_inv_blur = cv2.GaussianBlur(255.0 - g2, (3, 3), 0)
     lap1 = cv2.Laplacian(g1_blur, cv2.CV_32F)
-    lap2 = cv2.Laplacian(g2_blur, cv2.CV_32F)
-    res_edge = cv2.matchTemplate(lap2, lap1, cv2.TM_CCOEFF_NORMED)
-    _, max_edge_score, _, _ = cv2.minMaxLoc(res_edge)
+    max_edge_score = -1.0
+    for cand in (g2_blur, g2_inv_blur):
+        lap2 = cv2.Laplacian(cand, cv2.CV_32F)
+        res_edge = cv2.matchTemplate(lap2, lap1, cv2.TM_CCOEFF_NORMED)
+        _, ms, _, _ = cv2.minMaxLoc(res_edge)
+        max_edge_score = max(max_edge_score, ms)
     score_edges = max(0.0, float(max_edge_score) * 100.0)
 
-    return (score_color * 0.35) + (score_hist * 0.25) + (score_struct * 0.20) + (score_edges * 0.20)
+    # 5. Textura: ILBP + Haralick comparados por similitud de coseno
+    f1 = _texture_features(g1)
+    f2 = _texture_features(g2)
+    if f1 is not None and f2 is not None:
+        num = float(np.dot(f1, f2))
+        den = float(np.linalg.norm(f1) * np.linalg.norm(f2)) + 1e-7
+        score_texture = max(0.0, num / den) * 100.0
+    else:
+        score_texture = None
 
-def evaluate_pattern_multiscale(patch_bgr, target_variants, norm_size=(64, 44)):
+    # 6. ORB (solo si se proporciona caché, es la métrica más costosa)
+    score_orb = _orb_match_score(patch_bgr, target_resized, orb_cache) if orb_cache is not None else None
+
+    # --- Fusión ponderada con renormalización según métricas disponibles ---
+    parts = [(score_color, W_COLOR), (score_hist, W_HIST), (score_struct, W_STRUCT), (score_edges, W_EDGES)]
+    if score_texture is not None:
+        parts.append((score_texture, W_TEXTURE))
+    else:
+        parts.append((score_color, W_TEXTURE))  # color sustituye a textura
+    if score_orb is not None and score_orb > 0.0:
+        parts.append((score_orb, W_ORB))
+    elif score_orb is not None:
+        # ORB se calculó pero no encontró puntos (trama suave/ruido):
+        # no es una evidencia negativa, simplemente no aporta.
+        parts.append((score_struct, W_ORB))
+    else:
+        parts.append((score_struct, W_ORB))     # estructura sustituye a ORB
+    total_w = sum(wt for _, wt in parts)
+    return sum(s * wt for s, wt in parts) / total_w
+
+def evaluate_pattern_multiscale(patch_bgr, target_variants, norm_size=(64, 44), use_orb=True):
+    """
+    Evalúa un parche contra todas las variantes de un patrón y devuelve
+    el mejor score, combinando:
+      - Score en escala nativa (máxima resolución, incluye ORB).
+      - Media de las escalas normalizada (64x44) y reducida (48x33):
+        promediar escalas pequeñas reduce el ruido de cualquier escala
+        individual, que era una fuente de falsos positivos.
+    Se devuelve max(nativa, media_escalas) para no perder ni la precisión
+    de la escala nativa ni la robustez de las reducidas.
+    """
     best = 0.0
+    orb_cache = {}
     for tv in target_variants:
-        s_native = _combined_image_score(patch_bgr, tv)
+        s_native = _combined_image_score(patch_bgr, tv, orb_cache if use_orb else None)
         p_norm = cv2.resize(patch_bgr, norm_size, interpolation=cv2.INTER_AREA)
         t_norm = cv2.resize(tv, norm_size, interpolation=cv2.INTER_AREA)
         s_norm = _combined_image_score(p_norm, t_norm)
@@ -170,34 +673,108 @@ def evaluate_pattern_multiscale(patch_bgr, target_variants, norm_size=(64, 44)):
         p_small = cv2.resize(patch_bgr, (small_w, small_h), interpolation=cv2.INTER_AREA)
         t_small = cv2.resize(tv, (small_w, small_h), interpolation=cv2.INTER_AREA)
         s_small = _combined_image_score(p_small, t_small)
-        best = max(best, s_native, s_norm, s_small)
+        s_scaled = (s_norm + s_small) / 2.0
+        best = max(best, s_native, s_scaled)
     return best
 
 class DINOv2Extractor:
-    def __init__(self):
-        self.device = torch.device("cpu")
-        self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
-        self.model.eval()
-        self.model.to(self.device)
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+    """
+    Extractor de embeddings semánticos con DINOv2 (Visión por IA).
 
-    @torch.no_grad()
-    def get_embedding(self, rgb_numpy):
-        if rgb_numpy is None or rgb_numpy.size == 0: 
-            return None
-        pil_img = Image.fromarray(rgb_numpy).convert("RGB")
+    Mejoras respecto a la versión básica:
+      - Disponibilidad opcional: si torch o el modelo no pueden cargarse,
+        `available` queda en False y el pipeline sigue con métricas clásicas.
+      - Multi-crop: el embedding de una imagen es la media de 3 vistas
+        (completa, zoom central 80% y zoom central 60%), más robusta a
+        márgenes y encuadres distintos entre parche y patrón.
+      - Caché en disco (.dino_cache/): los embeddings de los patrones del
+        catálogo se guardan por hash del archivo, acelerando ejecuciones
+        posteriores.
+    """
+
+    def __init__(self, cache_dir=None):
+        self.available = False
+        self.device = None
+        self.model = None
+        self.transform = None
+        self.cache_dir = cache_dir or os.path.join(BASE_DIR, ".dino_cache")
+        self._mem_cache = {}
+        if not TORCH_AVAILABLE:
+            return
+        try:
+            self.device = torch.device("cpu")
+            self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+            self.model.eval()
+            self.model.to(self.device)
+            self.transform = transforms.Compose([
+                transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            os.makedirs(self.cache_dir, exist_ok=True)
+            self.available = True
+        except Exception:
+            # Sin red o sin pesos: el sistema opera sin IA
+            self.model = None
+            self.available = False
+
+    def _embed_single(self, pil_img):
         t = self.transform(pil_img).unsqueeze(0).to(self.device)
         feat = self.model(t).squeeze(0).numpy()
         norm = np.linalg.norm(feat)
         return feat / (norm + 1e-7)
 
+    def get_embedding(self, rgb_numpy):
+        """Embedding multi-crop normalizado (o None si no disponible)."""
+        if not self.available or rgb_numpy is None or rgb_numpy.size == 0:
+            return None
+        # Caché en memoria por contenido (evita recalcular el mismo parche)
+        key = hashlib.md5(rgb_numpy.tobytes()).hexdigest()
+        if key in self._mem_cache:
+            return self._mem_cache[key]
+        pil_img = Image.fromarray(rgb_numpy).convert("RGB")
+        w, h = pil_img.size
+        crops = [pil_img]
+        if w >= 8 and h >= 8:
+            # Zoom central 80% y 60%: robustez a bordes y encuadre
+            for f in (0.8, 0.6):
+                cw, ch = max(4, int(w * f)), max(4, int(h * f))
+                x0, y0 = (w - cw) // 2, (h - ch) // 2
+                crops.append(pil_img.crop((x0, y0, x0 + cw, y0 + ch)))
+        with torch.no_grad():
+            embs = [self._embed_single(c) for c in crops]
+        feat = np.mean(np.stack(embs), axis=0)
+        feat = feat / (np.linalg.norm(feat) + 1e-7)
+        self._mem_cache[key] = feat
+        return feat
+
+    def get_embedding_cached_file(self, filepath, rgb_numpy):
+        """
+        Embedding de un archivo de patrón con caché persistente en disco.
+        La clave incluye ruta + tamaño + mtime, así se invalida si el
+        archivo cambia.
+        """
+        if not self.available:
+            return None
+        try:
+            st = os.stat(filepath)
+            sig = f"{os.path.abspath(filepath)}|{st.st_size}|{int(st.st_mtime)}"
+            disk_key = os.path.join(self.cache_dir, hashlib.md5(sig.encode()).hexdigest() + ".npy")
+            if os.path.isfile(disk_key):
+                return np.load(disk_key)
+            emb = self.get_embedding(rgb_numpy)
+            if emb is not None:
+                try:
+                    np.save(disk_key, emb)
+                except OSError:
+                    pass  # caché no escribible: no es crítico
+            return emb
+        except OSError:
+            return self.get_embedding(rgb_numpy)
+
     @staticmethod
     def cosine_similarity(emb1, emb2):
-        if emb1 is None or emb2 is None: 
+        if emb1 is None or emb2 is None:
             return 0.0
         return max(0.0, float(np.dot(emb1, emb2))) * 100.0
 
@@ -271,11 +848,39 @@ class ProcessingWorker(QThread):
                     break
             text_region = img_np[max(0, by-2):min(img_h, by+bh+2), (bx + bw + 1):end_x]
 
+            # --- OCR multi-estrategia -------------------------------------
+            # El texto de los logs suele venir pequeño y con fondo irregular.
+            # Se prueban 3 preprocesamientos y se conserva el resultado con
+            # mayor confianza media del reconocedor:
+            #   A) imagen original
+            #   B) escala x2 en grises (mejora trazos finos)
+            #   C) escala x2 + binarización de Otsu (fondo uniforme)
             ocr_text = ""
             if text_region.size > 0:
-                res = reader.readtext(text_region, detail=0)
-                ocr_text = " ".join(res).strip()
-                for ch in ["?", "_", "|", "}", "{"]: 
+                variants = [text_region]
+                try:
+                    tr_gray = cv2.cvtColor(text_region, cv2.COLOR_RGB2GRAY)
+                    tr_big = cv2.resize(tr_gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+                    variants.append(tr_big)
+                    _, tr_otsu = cv2.threshold(tr_big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    variants.append(tr_otsu)
+                except cv2.error:
+                    pass
+                best_txt, best_conf = "", -1.0
+                for variant in variants:
+                    try:
+                        res = reader.readtext(variant, detail=1, paragraph=False)
+                    except Exception:
+                        continue
+                    if not res:
+                        continue
+                    txt = " ".join(r[1] for r in res).strip()
+                    conf = float(np.mean([r[2] for r in res]))
+                    # Se prefiere el texto más largo si la confianza empata
+                    if conf > best_conf + 0.02 or (abs(conf - best_conf) <= 0.02 and len(txt) > len(best_txt)):
+                        best_txt, best_conf = txt, conf
+                ocr_text = best_txt
+                for ch in ["?", "_", "|", "}", "{"]:
                     ocr_text = ocr_text.replace(ch, "")
                 ocr_text = ocr_text.strip()
 
@@ -289,9 +894,10 @@ class ProcessingWorker(QThread):
         self.stage_changed.emit("Etapa 3: Identificación Litológica")
         self.progress.emit(55, "Correlacionando con geo_lith.csv...")
         for seg in segments:
-            id_lith, matched_name = match_lith_name(seg["ocr_text"], self.geo_lith)
+            id_lith, matched_name, ocr_conf = match_lith_name(seg["ocr_text"], self.geo_lith)
             seg["idLith"] = id_lith
             seg["matched_nombre"] = matched_name
+            seg["ocr_conf"] = ocr_conf
 
         self.stage_changed.emit("Etapa 4: Clasificación Visual y Desempate Fino")
         self.progress.emit(65, "Indexando catálogo de patrones...")
@@ -319,7 +925,8 @@ class ProcessingWorker(QThread):
                 variants.append(target)
 
             target_rgb = cv2.cvtColor(variants[0], cv2.COLOR_BGR2RGB)
-            dino_emb = ai_extractor.get_embedding(target_rgb)
+            # Caché persistente: no recalcula embeddings de patrones ya vistos
+            dino_emb = ai_extractor.get_embedding_cached_file(fp, target_rgb)
 
             catalog.append({
                 "filename": pf,
@@ -340,6 +947,7 @@ class ProcessingWorker(QThread):
             seg_dino = ai_extractor.get_embedding(pure_rgb)
             name_clean = seg["matched_nombre"].upper()
             id_val = seg["idLith"]
+            ocr_conf = seg.get("ocr_conf", 0.0)
 
             best_file = ""
             best_score = -1.0
@@ -350,27 +958,28 @@ class ProcessingWorker(QThread):
                     evaluate_pattern_multiscale(patch_bgr, cat_item["variants"])
                 )
 
+                # Fusión IA + métricas clásicas. Si DINOv2 no está disponible
+                # para alguno de los lados, el score es 100% métricas clásicas.
                 s_dino = ai_extractor.cosine_similarity(seg_dino, cat_item["dino_emb"])
-                score_final = (s_cv * 0.75) + (s_dino * 0.25)
+                if seg_dino is not None and cat_item["dino_emb"] is not None:
+                    score_final = (s_cv * (1.0 - DINO_WEIGHT)) + (s_dino * DINO_WEIGHT)
+                else:
+                    score_final = s_cv
 
                 bname = cat_item["basename"]
 
-                # Desempates litológicos
-                if id_val == 8 or ("ARCILITA" in name_clean and "TOB" in name_clean):
-                    if bname == "12": score_final += 3.5
-                    elif bname == "4-8": score_final -= 3.5
-
-                elif id_val == 21 or "DOLOMITA" in name_clean:
-                    if bname in ("18", "7-3"): score_final += 3.5
-                    elif bname == "5-2": score_final -= 3.5
-
-                elif id_val == 5 or ("ARENISCA" in name_clean and "CALCAREA" in name_clean):
-                    if bname == "5": score_final += 3.5
-                    elif bname == "5-4": score_final -= 3.5
-
-                elif id_val == 38 or ("CALIZA" in name_clean and "ARCILL" in name_clean):
-                    if bname == "17": score_final += 3.5
-                    elif bname in ("15", "5-2"): score_final -= 3.5
+                # --- Desempate litológico escalado por confianza OCR -------
+                # La clave geológica se resuelve en _geology_from_name a
+                # partir del idLith o del nombre (con fuzzy de tokens), así
+                # "ARCILITA TOBACEA" y "ARCILITA TOB." comparten desempate
+                # aunque el OCR las haya clasificado distinto.
+                # El ajuste es proporcional a la confianza del OCR: con OCR
+                # dudoso apenas influye y no fuerza errores en patrones
+                # básicos (problema que tenía la versión anterior).
+                geo_key = _geology_from_name(name_clean, id_val, self.geo_lith)
+                if geo_key is not None and geo_key in LITHOLOGY_AFFINITIES:
+                    adj = LITHOLOGY_AFFINITIES[geo_key].get(bname, 0.0)
+                    score_final += adj * TIE_BREAK_STRENGTH * ocr_conf
 
                 if score_final > best_score:
                     best_score = score_final
@@ -392,6 +1001,7 @@ class ProcessingWorker(QThread):
                 "ocr_text": seg["ocr_text"],
                 "matched_nombre": seg["matched_nombre"],
                 "pattern_score": seg["pattern_score"],
+                "ocr_conf": seg.get("ocr_conf", 0.0),
                 "patch": seg["patch"],
                 "box": seg["box"],
             })
@@ -846,7 +1456,8 @@ class MainWindow(QMainWindow):
             qimg = QImage(pc.data, w, h, c * w, QImage.Format_RGB888)
             self.lbl_insp_patch.setPixmap(QPixmap.fromImage(qimg).scaled(self.lbl_insp_patch.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-        self.lbl_insp_info.setText(f"idLith: {r['idLith']}\nNombre: {r['matched_nombre']}\nOCR: {r['ocr_text']}")
+        conf = r.get("ocr_conf", 0.0)
+        self.lbl_insp_info.setText(f"idLith: {r['idLith']}\nNombre: {r['matched_nombre']}\nOCR: {r['ocr_text']} ({conf*100:.0f}%)")
         combo = self.table_results.cellWidget(row, 7)
         score = combo.property("score_text") if isinstance(combo, QComboBox) else f"{r['pattern_score']:.1f}"
         if r["patternImage"]:
