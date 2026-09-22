@@ -1,0 +1,1173 @@
+"""
+Lith_main.py – Lithological Pattern Analyzer
+=============================================
+Segments a lithological legend image, performs OCR on each text label,
+matches extracted pattern patches against a library of reference patterns,
+cross-references with geo_lith.csv for idLith, and exports the result
+as CSV or PostgreSQL-compatible SQL.
+
+Designed to run on CPU (no GPU required).
+"""
+
+import sys
+import os
+import io
+import csv
+import base64
+import cv2
+import numpy as np
+import easyocr
+from PIL import Image
+from difflib import get_close_matches, SequenceMatcher
+
+from PySide6.QtCore import Qt, Signal, QThread, QSize
+from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPalette, QIcon
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QFileDialog, QTextEdit, QSplitter, QTableWidget, QTableWidgetItem,
+    QPushButton, QGroupBox, QStackedWidget, QProgressBar,
+    QDialog, QFormLayout, QLineEdit, QMessageBox, QFrame, QGridLayout,
+    QSpinBox, QHeaderView, QComboBox, QSizePolicy,
+)
+
+# ---------------------------------------------------------------------------
+# Paths (auto-resolved relative to this script)
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CSV_PATH = os.path.join(BASE_DIR, "geo_lith.csv")
+DEFAULT_PATTERNS_DIR = os.path.join(BASE_DIR, "Patterns")
+
+# ---------------------------------------------------------------------------
+# Dark palette / stylesheet
+# ---------------------------------------------------------------------------
+DARK_STYLE = """
+QMainWindow, QWidget {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    font-family: 'Segoe UI', 'Cantarell', sans-serif;
+}
+QGroupBox {
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 14px;
+    font-weight: bold;
+    color: #89b4fa;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+}
+QPushButton {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 5px;
+    padding: 6px 14px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background-color: #45475a;
+    border-color: #89b4fa;
+}
+QPushButton:pressed {
+    background-color: #585b70;
+}
+QPushButton#accentBtn {
+    background-color: #89b4fa;
+    color: #1e1e2e;
+    border: none;
+}
+QPushButton#accentBtn:hover {
+    background-color: #74c7ec;
+}
+QPushButton#dangerBtn {
+    background-color: #f38ba8;
+    color: #1e1e2e;
+    border: none;
+}
+QProgressBar {
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    text-align: center;
+    background-color: #313244;
+    color: #cdd6f4;
+    height: 22px;
+}
+QProgressBar::chunk {
+    background-color: #89b4fa;
+    border-radius: 3px;
+}
+QTableWidget {
+    background-color: #181825;
+    alternate-background-color: #1e1e2e;
+    color: #cdd6f4;
+    gridline-color: #45475a;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    selection-background-color: #45475a;
+}
+QHeaderView::section {
+    background-color: #313244;
+    color: #89b4fa;
+    border: 1px solid #45475a;
+    padding: 4px;
+    font-weight: bold;
+}
+QTextEdit, QLineEdit, QSpinBox, QComboBox {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    padding: 4px;
+}
+QLabel#phaseLabel {
+    font-size: 13px;
+    font-weight: bold;
+    color: #a6e3a1;
+    padding: 4px;
+}
+QLabel#statusLabel {
+    font-size: 12px;
+    color: #f9e2af;
+    padding: 2px;
+}
+QSplitter::handle {
+    background-color: #45475a;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Load reference CSV into list of dicts
+# ---------------------------------------------------------------------------
+def load_geo_lith_csv(path):
+    """Returns list of {'idLith': int, 'nombre': str}."""
+    records = []
+    if not os.path.isfile(path):
+        return records
+    with open(path, mode="r", encoding="utf-8-sig") as f:
+        sample = f.read(2048)
+        f.seek(0)
+        delimiter = ";" if ";" in sample else ","
+        reader = csv.reader(f, delimiter=delimiter)
+        header = next(reader, None)
+        if not header:
+            return records
+        # Detect column indices
+        col_id, col_name = None, None
+        for idx, h in enumerate(header):
+            hl = h.strip().strip('"').lower()
+            if hl in ("idlith",):
+                col_id = idx
+            elif hl in ("nombre", "name", "litologia"):
+                col_name = idx
+            elif hl in ("id", "code", "codigo") and col_id is None:
+                col_id = idx
+        if col_id is None:
+            col_id = 0
+        if col_name is None:
+            col_name = 1
+        for row in reader:
+            if len(row) <= max(col_id, col_name):
+                continue
+            id_str = row[col_id].strip().strip('"')
+            name_str = row[col_name].strip().strip('"')
+            if not id_str:
+                continue
+            try:
+                id_val = int(id_str)
+            except ValueError:
+                continue
+            records.append({"idLith": id_val, "nombre": name_str})
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Image comparison: perceptual colour (CIE L*a*b*) + texture (Laplacian
+# gradients) + structure (NCC) + colour histograms.
+# Combines the full capability of the previous version (Delta E + Laplacian
+# matchTemplate at native resolution) with complementary metrics evaluated at
+# both the native patch size and a normalized size, and scans several
+# background fills for RGBA patterns, keeping the best score.
+# ---------------------------------------------------------------------------
+def _lab_deltae_edges_score(patch_bgr, target_bgr, interp):
+    """Previous-version score: CIE L*a*b* Delta E colour + Laplacian edges."""
+    h, w = patch_bgr.shape[:2]
+    if h < 5 or w < 5:
+        return 0.0
+    target_resized = cv2.resize(target_bgr, (w, h), interpolation=interp)
+
+    # 1. Perceptual colour: CIE L*a*b* Delta E
+    lab1 = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB)
+    lab2 = cv2.cvtColor(target_resized, cv2.COLOR_BGR2LAB)
+    diff_lab = np.linalg.norm(lab1.astype(np.float32) - lab2.astype(np.float32), axis=2)
+    score_color = max(0.0, 100.0 - np.mean(diff_lab) * 2.2)
+
+    # 2. Texture: Laplacian gradient template matching
+    g1 = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(target_resized, cv2.COLOR_BGR2GRAY)
+    lap1 = cv2.Laplacian(g1, cv2.CV_32F)
+    lap2 = cv2.Laplacian(g2, cv2.CV_32F)
+    res_edge = cv2.matchTemplate(lap2, lap1, cv2.TM_CCOEFF_NORMED)
+    _, max_edge_score, _, _ = cv2.minMaxLoc(res_edge)
+    score_edges = max(0.0, float(max_edge_score) * 100.0)
+
+    return score_color * 0.50 + score_edges * 0.50
+
+
+def _hist_ncc_lab_score(patch_bgr, target_bgr, interp):
+    """Complementary score: HSV histograms + NCC structure + LAB difference."""
+    h, w = patch_bgr.shape[:2]
+    if h < 5 or w < 5:
+        return 0.0
+    target_resized = cv2.resize(target_bgr, (w, h), interpolation=interp)
+
+    # 1. Colour histogram comparison (HSV, finer bins)
+    p_hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
+    t_hsv = cv2.cvtColor(target_resized, cv2.COLOR_BGR2HSV)
+    score_hist = 0.0
+    for ch in range(3):
+        h1 = cv2.calcHist([p_hsv], [ch], None, [64], [0, 256])
+        h2 = cv2.calcHist([t_hsv], [ch], None, [64], [0, 256])
+        cv2.normalize(h1, h1)
+        cv2.normalize(h2, h2)
+        score_hist += cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+    score_hist = max(0.0, score_hist / 3.0) * 100.0
+
+    # 2. Structural: normalized cross-correlation on grayscale
+    g1 = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g2 = cv2.cvtColor(target_resized, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g1_n = (g1 - g1.mean()) / max(g1.std(), 1e-5)
+    g2_n = (g2 - g2.mean()) / max(g2.std(), 1e-5)
+    ncc = float(np.mean(g1_n * g2_n))
+    score_struct = max(0.0, ncc) * 100.0
+
+    # 3. Mean absolute difference in LAB colour space
+    lab1 = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab2 = cv2.cvtColor(target_resized, cv2.COLOR_BGR2LAB).astype(np.float32)
+    delta_e = np.mean(np.abs(lab1 - lab2))
+    score_lab = max(0.0, 100.0 - delta_e * 1.5)
+
+    return score_hist * 0.40 + score_struct * 0.35 + score_lab * 0.25
+
+
+def _combined_image_score(patch_bgr, target_bgr):
+    """A more robust score that combines color, histogram, structure and edges."""
+    if patch_bgr is None or target_bgr is None:
+        return 0.0
+    h, w = patch_bgr.shape[:2]
+    if h < 5 or w < 5:
+        return 0.0
+
+    target_resized = cv2.resize(target_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    # 1. Perceptual colour: CIE L*a*b* Delta E
+    patch_lab = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    target_lab = cv2.cvtColor(target_resized, cv2.COLOR_BGR2LAB).astype(np.float32)
+    diff_lab = np.linalg.norm(patch_lab - target_lab, axis=2)
+    score_color = max(0.0, 100.0 - np.mean(diff_lab) * 1.4)
+
+    # 2. Histogram comparison (RGB + HSV) for chromatic robustness
+    score_hist = 0.0
+    for src, dst in ((patch_bgr, target_resized), (cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV), cv2.cvtColor(target_resized, cv2.COLOR_BGR2HSV))):
+        for ch in range(3):
+            h1 = cv2.calcHist([src], [ch], None, [32], [0, 256])
+            h2 = cv2.calcHist([dst], [ch], None, [32], [0, 256])
+            cv2.normalize(h1, h1)
+            cv2.normalize(h2, h2)
+            score_hist += cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+    score_hist = max(0.0, score_hist / 6.0) * 100.0
+
+    # 3. Structural similarity via normalized cross-correlation on grayscale
+    g1 = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g2 = cv2.cvtColor(target_resized, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g1_n = (g1 - g1.mean()) / max(g1.std(), 1e-5)
+    g2_n = (g2 - g2.mean()) / max(g2.std(), 1e-5)
+    ncc = float(np.mean(g1_n * g2_n))
+    score_struct = max(0.0, ncc) * 100.0
+
+    # 4. Texture / edges using Laplacian response
+    g1_blur = cv2.GaussianBlur(g1, (3, 3), 0)
+    g2_blur = cv2.GaussianBlur(g2, (3, 3), 0)
+    lap1 = cv2.Laplacian(g1_blur, cv2.CV_32F)
+    lap2 = cv2.Laplacian(g2_blur, cv2.CV_32F)
+    res_edge = cv2.matchTemplate(lap2, lap1, cv2.TM_CCOEFF_NORMED)
+    _, max_edge_score, _, _ = cv2.minMaxLoc(res_edge)
+    score_edges = max(0.0, float(max_edge_score) * 100.0)
+
+    return score_color * 0.35 + score_hist * 0.25 + score_struct * 0.20 + score_edges * 0.20
+
+
+def compare_images(patch_rgb, target_path, target_size=None):
+    """Return similarity score 0-100 between a patch (numpy RGB) and a file."""
+    try:
+        target = cv2.imread(target_path, cv2.IMREAD_UNCHANGED)
+        if target is None:
+            return 0.0
+        # Handle RGBA: build variants with transparent pixels on several
+        # background fills, since the correct background is unknown
+        variants = []
+        if target.ndim == 3 and target.shape[2] == 4:
+            alpha = target[:, :, 3]
+            base = cv2.cvtColor(target, cv2.COLOR_BGRA2BGR)
+            for bg in ((255, 255, 255), (0, 0, 0)):
+                filled = base.copy()
+                filled[alpha < 128] = list(bg)
+                variants.append(filled)
+            variants.append(base)  # ignore alpha altogether
+        elif target.ndim == 2:
+            variants.append(cv2.cvtColor(target, cv2.COLOR_GRAY2BGR))
+        else:
+            variants.append(target)
+
+        patch_bgr = cv2.cvtColor(patch_rgb, cv2.COLOR_RGB2BGR)
+        norm_size = target_size or (64, 44)
+
+        best = 0.0
+        for tv in variants:
+            # Native patch resolution (how the previous version compared)
+            s_native = _combined_image_score(patch_bgr, tv)
+            # Normalized size (robust to aspect/size differences)
+            p_norm = cv2.resize(patch_bgr, norm_size, interpolation=cv2.INTER_AREA)
+            t_norm = cv2.resize(tv, norm_size, interpolation=cv2.INTER_AREA)
+            s_norm = _combined_image_score(p_norm, t_norm)
+            # Small-scale variant for stronger resilience to different resolutions
+            small_w = max(16, int(norm_size[0] * 0.75))
+            small_h = max(16, int(norm_size[1] * 0.75))
+            p_small = cv2.resize(patch_bgr, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            t_small = cv2.resize(tv, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            s_small = _combined_image_score(p_small, t_small)
+            best = max(best, s_native, s_norm, s_small)
+        return round(best, 2)
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy match OCR text to geo_lith nombre
+# ---------------------------------------------------------------------------
+def match_lith_name(ocr_text, geo_lith_records):
+    """Returns (idLith, matched_nombre) or (-1, ocr_text)."""
+    if not geo_lith_records or not ocr_text.strip():
+        return -1, ocr_text
+    upper = ocr_text.upper().strip()
+    names = [r["nombre"].upper().strip() for r in geo_lith_records]
+
+    # Exact
+    if upper in names:
+        idx = names.index(upper)
+        return geo_lith_records[idx]["idLith"], geo_lith_records[idx]["nombre"]
+
+    # Close match
+    matches = get_close_matches(upper, names, n=1, cutoff=0.45)
+    if matches:
+        idx = names.index(matches[0])
+        return geo_lith_records[idx]["idLith"], geo_lith_records[idx]["nombre"]
+
+    # Substring
+    for i, n in enumerate(names):
+        if n and (n in upper or upper in n):
+            return geo_lith_records[i]["idLith"], geo_lith_records[i]["nombre"]
+
+    # Partial ratio
+    best_score, best_idx = 0, -1
+    for i, n in enumerate(names):
+        if not n:
+            continue
+        s = SequenceMatcher(None, upper, n).ratio()
+        if s > best_score:
+            best_score = s
+            best_idx = i
+    if best_score >= 0.35 and best_idx >= 0:
+        return geo_lith_records[best_idx]["idLith"], geo_lith_records[best_idx]["nombre"]
+
+    return -1, ocr_text
+
+
+# ---------------------------------------------------------------------------
+# JSON-safe conversion utilities
+# ---------------------------------------------------------------------------
+def _make_json_safe(value):
+    """Recursively convert numpy and other non-JSON-native values into JSON-safe data."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return []
+        try:
+            if value.ndim == 2:
+                encoded = cv2.imencode(".png", value)
+                payload = base64.b64encode(encoded[1]).decode("ascii")
+                return {
+                    "__type__": "ndarray",
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                    "encoding": "png",
+                    "data": payload,
+                }
+            if value.ndim == 3:
+                encoded = cv2.imencode(".png", cv2.cvtColor(value, cv2.COLOR_RGB2BGR))
+                payload = base64.b64encode(encoded[1]).decode("ascii")
+                return {
+                    "__type__": "ndarray",
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                    "encoding": "png",
+                    "data": payload,
+                }
+        except Exception:
+            pass
+        return {
+            "__type__": "ndarray",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "data": value.tolist(),
+        }
+    if isinstance(value, dict):
+        return {str(k): _make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(v) for v in value]
+    if hasattr(value, "tolist") and callable(value.tolist):
+        try:
+            return _make_json_safe(value.tolist())
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def serialize_results_for_json(results):
+    """Return a JSON-safe representation of processing results."""
+    return [_make_json_safe(r) for r in results]
+
+
+# ---------------------------------------------------------------------------
+# Worker thread: segmentation + OCR + pattern matching
+# ---------------------------------------------------------------------------
+class ProcessingWorker(QThread):
+    progress = Signal(int, str)       # (percentage, message)
+    stage_changed = Signal(str)       # stage name
+    finished = Signal(object)         # payload with results and JSON-safe copy
+    error = Signal(str)
+
+    def __init__(self, image_path, geo_lith, patterns_dir, id_operadora):
+        super().__init__()
+        self.image_path = image_path
+        self.geo_lith = geo_lith
+        self.patterns_dir = patterns_dir
+        self.id_operadora = id_operadora
+
+    def run(self):
+        try:
+            self._process()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _process(self):
+        # --- Stage 1: Load & Segment ---
+        self.stage_changed.emit("Etapa 1: Cargando imagen y segmentando")
+        self.progress.emit(5, "Cargando imagen...")
+
+        img_pil = Image.open(self.image_path).convert("RGB")
+        img_np = np.array(img_pil)
+        img_h, img_w = img_np.shape[:2]
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+        self.progress.emit(10, "Detectando recuadros de patrones...")
+        _, thresh = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        boxes = []
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            aspect = w / max(h, 1)
+            if 15 < w < 100 and 8 < h < 60 and 0.4 < aspect < 4.0:
+                boxes.append((x, y, w, h))
+        boxes.sort(key=lambda b: (b[1], b[0]))
+        self.progress.emit(20, f"Encontrados {len(boxes)} segmentos.")
+
+        if not boxes:
+            self.error.emit("No se detectaron segmentos de patrones en la imagen.")
+            return
+
+        # Determine column boundaries for text extraction
+        xs = sorted(set(b[0] for b in boxes))
+        col_starts = []
+        for xv in xs:
+            if not col_starts or xv - col_starts[-1] > 50:
+                col_starts.append(xv)
+        col_ends = col_starts[1:] + [img_w]
+
+        # --- Stage 2: OCR ---
+        self.stage_changed.emit("Etapa 2: Reconocimiento de texto (OCR)")
+        self.progress.emit(25, "Inicializando EasyOCR (puede tardar)...")
+        reader = easyocr.Reader(["es", "en"], gpu=False, verbose=False)
+        self.progress.emit(35, "Motor OCR listo. Procesando textos...")
+
+        segments = []  # list of (patch_rgb, ocr_text, box)
+        total = len(boxes)
+        for i, (bx, by, bw, bh) in enumerate(boxes):
+            pct = 35 + int((i / total) * 25)
+            self.progress.emit(pct, f"OCR segmento {i+1}/{total}...")
+
+            # Extract pattern patch
+            patch = img_np[by:by+bh, bx:bx+bw]
+
+            # Pure pattern patch: inner 2px crop removes the box border
+            # (the previous version compared against this borderless trama)
+            ph, pw = patch.shape[:2]
+            if ph > 8 and pw > 8:
+                pure_patch = np.ascontiguousarray(patch[2:ph-2, 2:pw-2])
+            else:
+                pure_patch = patch
+
+            # Determine text region end (use full width for last column)
+            end_x = img_w
+            for ce in col_ends:
+                if bx + bw + 5 < ce:
+                    end_x = ce
+                    break
+            # Start text extraction right after the box, with slight vertical padding
+            text_x_start = bx + bw + 1
+            text_region = img_np[max(0, by-2):min(img_h, by+bh+2), text_x_start:end_x]
+
+            ocr_text = ""
+            if text_region.size > 0:
+                results = reader.readtext(text_region, detail=0)
+                ocr_text = " ".join(results).strip()
+                # Clean up common OCR artifacts
+                for ch in ["?", "_", "|", "}", "{"]:
+                    ocr_text = ocr_text.replace(ch, "")
+                ocr_text = ocr_text.strip()
+
+            segments.append({
+                "patch": patch,
+                "pure_patch": pure_patch,
+                "ocr_text": ocr_text,
+                "box": (bx, by, bw, bh),
+            })
+
+        # --- Stage 3: Match OCR to geo_lith ---
+        self.stage_changed.emit("Etapa 3: Identificación litológica (geo_lith)")
+        self.progress.emit(60, "Correlacionando textos con geo_lith.csv...")
+
+        for i, seg in enumerate(segments):
+            pct = 60 + int((i / total) * 10)
+            self.progress.emit(pct, f"Identificando {i+1}/{total}: '{seg['ocr_text']}'")
+            id_lith, matched_name = match_lith_name(seg["ocr_text"], self.geo_lith)
+            seg["idLith"] = id_lith
+            seg["matched_nombre"] = matched_name
+
+        # --- Stage 4: Pattern image matching ---
+        self.stage_changed.emit("Etapa 4: Comparación con patrones de referencia")
+        self.progress.emit(70, "Cargando patrones de referencia...")
+
+        pattern_files = []
+        if os.path.isdir(self.patterns_dir):
+            exts = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
+            pattern_files = [
+                f for f in os.listdir(self.patterns_dir) if f.lower().endswith(exts)
+            ]
+
+        for i, seg in enumerate(segments):
+            pct = 70 + int((i / total) * 25)
+            self.progress.emit(pct, f"Comparando patrón {i+1}/{total}...")
+
+            best_file = ""
+            best_score = 0.0
+            patch = seg["patch"]
+            pure_patch = seg["pure_patch"]
+            if patch.size > 0 and pattern_files:
+                for pf in pattern_files:
+                    fp = os.path.join(self.patterns_dir, pf)
+                    # Compare both the raw box and the borderless pure patch
+                    # (the previous version matched using the pure trama)
+                    sc = max(
+                        compare_images(pure_patch, fp),
+                        compare_images(patch, fp),
+                    )
+                    if sc > best_score:
+                        best_score = sc
+                        best_file = pf
+            seg["patternImage"] = best_file
+            seg["pattern_score"] = best_score
+
+        # --- Build final results ---
+        self.stage_changed.emit("Completado")
+        self.progress.emit(100, f"Procesamiento finalizado: {len(segments)} elementos.")
+
+        results = []
+        for idx, seg in enumerate(segments, start=1):
+            results.append({
+                "id": idx,
+                "patternImage": seg["patternImage"],
+                "idLith": seg["idLith"],
+                "idOperadora": self.id_operadora,
+                "ocr_text": seg["ocr_text"],
+                "matched_nombre": seg["matched_nombre"],
+                "pattern_score": seg["pattern_score"],
+                "patch": seg["patch"],
+                "box": seg["box"],
+            })
+        self.finished.emit({
+            "results": results,
+            "json_results": serialize_results_for_json(results),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Export dialog (CSV or SQL)
+# ---------------------------------------------------------------------------
+class ExportDialog(QDialog):
+    def __init__(self, results, parent=None):
+        super().__init__(parent)
+        self.results = results
+        self.setWindowTitle("Exportar Resultados")
+        self.resize(460, 200)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.cmb_format = QComboBox()
+        self.cmb_format.addItems(["CSV (.csv)", "SQL MySQL (.sql)"])
+        form.addRow("Formato:", self.cmb_format)
+
+        self.txt_table = QLineEdit("correlacion_litologica")
+        form.addRow("Nombre tabla (SQL):", self.txt_table)
+        layout.addLayout(form)
+
+        btn = QPushButton("Exportar")
+        btn.setObjectName("accentBtn")
+        btn.setFixedHeight(36)
+        btn.clicked.connect(self.do_export)
+        layout.addWidget(btn)
+
+    def do_export(self):
+        fmt = self.cmb_format.currentIndex()
+        if fmt == 0:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar CSV", "resultado.csv", "CSV (*.csv)"
+            )
+            if path:
+                self._export_csv(path)
+        else:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar SQL", "resultado.sql", "SQL (*.sql)"
+            )
+            if path:
+                self._export_sql(path)
+
+    def _export_csv(self, path):
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["id", "patternImage", "idLith", "idOperadora"])
+                for r in self.results:
+                    writer.writerow([r["id"], r["patternImage"], r["idLith"], r["idOperadora"]])
+            QMessageBox.information(self, "Exportado", f"CSV guardado en:\n{path}")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _export_sql(self, path):
+        try:
+            table = self.txt_table.text().strip() or "correlacion_litologica"
+            lines = []
+            lines.append(f"CREATE TABLE IF NOT EXISTS `{table}` (")
+            lines.append("    `id` INT AUTO_INCREMENT PRIMARY KEY,")
+            lines.append("    `patternImage` VARCHAR(255) NOT NULL,")
+            lines.append("    `idLith` INT NOT NULL,")
+            lines.append("    `idOperadora` INT NOT NULL")
+            lines.append(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;")
+            lines.append("")
+            for r in self.results:
+                pi = r["patternImage"].replace("'", "\\'")
+                lines.append(
+                    f"INSERT INTO `{table}` (`patternImage`, `idLith`, `idOperadora`) "
+                    f"VALUES ('{pi}', {r['idLith']}, {r['idOperadora']});"
+                )
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            QMessageBox.information(self, "Exportado", f"SQL (MySQL) guardado en:\n{path}")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+
+# ---------------------------------------------------------------------------
+# Drop zone widget
+# ---------------------------------------------------------------------------
+class DropImageZone(QLabel):
+    imageSelected = Signal(str)  # emits file path
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setText("🖼️  Arrastrá una imagen aquí\no hacé clic para seleccionar")
+        self.setAcceptDrops(True)
+        self.setMinimumSize(280, 120)
+        self.setStyleSheet("""
+            QLabel {
+                border: 2px dashed #585b70;
+                border-radius: 10px;
+                background-color: #181825;
+                color: #a6adc8;
+                font-size: 13px;
+                padding: 20px;
+            }
+            QLabel:hover {
+                border-color: #89b4fa;
+                background-color: #1e1e2e;
+            }
+        """)
+        self._path = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Seleccionar Imagen", "",
+                "Imágenes (*.png *.jpg *.jpeg *.bmp *.tiff)"
+            )
+            if path:
+                self._set_image(path)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            fp = url.toLocalFile()
+            if fp.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
+                self._set_image(fp)
+                break
+
+    def _set_image(self, path):
+        self._path = path
+        pix = QPixmap(path)
+        scaled = pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.setPixmap(scaled)
+        self.imageSelected.emit(path)
+
+    def get_path(self):
+        return self._path
+
+
+# ---------------------------------------------------------------------------
+# Main Window
+# ---------------------------------------------------------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Lith → MySQL  ·  Analizador Litológico")
+        self.resize(1280, 780)
+
+        self.image_path = None
+        self.geo_lith = load_geo_lith_csv(DEFAULT_CSV_PATH)
+        self.patterns_dir = DEFAULT_PATTERNS_DIR
+        self.results = []
+        self.json_results = []
+        self.worker = None
+
+        self._build_ui()
+
+    # -- UI setup ----------------------------------------------------------
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 8)
+
+        # Phase indicator bar
+        phase_bar = QHBoxLayout()
+        self.phase_btns = []
+        labels = [
+            "① Configuración",
+            "② Procesamiento",
+            "③ Resultados y Exportación",
+        ]
+        for i, txt in enumerate(labels):
+            btn = QPushButton(txt)
+            btn.setFixedHeight(36)
+            btn.setEnabled(False)
+            btn.clicked.connect(lambda checked, idx=i: self.stacked.setCurrentIndex(idx))
+            phase_bar.addWidget(btn)
+            self.phase_btns.append(btn)
+        self.phase_btns[0].setEnabled(True)
+        root.addLayout(phase_bar)
+
+        # Status
+        self.lbl_status = QLabel("Configurá los parámetros y presioná Procesar.")
+        self.lbl_status.setObjectName("statusLabel")
+        root.addWidget(self.lbl_status)
+
+        # Stacked phases
+        self.stacked = QStackedWidget()
+        root.addWidget(self.stacked)
+
+        self.stacked.addWidget(self._build_phase1())
+        self.stacked.addWidget(self._build_phase2())
+        self.stacked.addWidget(self._build_phase3())
+
+    # -- Phase 1: Config ---------------------------------------------------
+    def _build_phase1(self):
+        w = QWidget()
+        lay = QHBoxLayout(w)
+
+        # Left: image
+        left = QVBoxLayout()
+        grp_img = QGroupBox("Imagen de Referencias Litológicas")
+        gl = QVBoxLayout(grp_img)
+        self.drop_zone = DropImageZone()
+        self.drop_zone.imageSelected.connect(self._on_image_selected)
+        gl.addWidget(self.drop_zone)
+        left.addWidget(grp_img)
+        lay.addLayout(left, stretch=2)
+
+        # Right: settings
+        right = QVBoxLayout()
+
+        # idOperadora
+        grp_op = QGroupBox("Datos de Operadora")
+        ol = QFormLayout(grp_op)
+        self.spn_operadora = QSpinBox()
+        self.spn_operadora.setRange(1, 999999)
+        self.spn_operadora.setValue(1)
+        ol.addRow("idOperadora:", self.spn_operadora)
+        right.addWidget(grp_op)
+
+        # CSV info
+        grp_csv = QGroupBox("Archivo geo_lith.csv")
+        cl = QVBoxLayout(grp_csv)
+        csv_status = f"✅ {len(self.geo_lith)} registros cargados" if self.geo_lith else "❌ No encontrado"
+        self.lbl_csv_status = QLabel(csv_status)
+        cl.addWidget(self.lbl_csv_status)
+        self.txt_csv_preview = QTextEdit()
+        self.txt_csv_preview.setReadOnly(True)
+        self.txt_csv_preview.setFixedHeight(120)
+        self.txt_csv_preview.setStyleSheet("font-family: 'Consolas', monospace; font-size: 11px;")
+        preview = "idLith | Nombre\n" + "─" * 35 + "\n"
+        for r in self.geo_lith[:8]:
+            preview += f"{r['idLith']:<6} | {r['nombre']}\n"
+        if len(self.geo_lith) > 8:
+            preview += f"... y {len(self.geo_lith)-8} más"
+        self.txt_csv_preview.setPlainText(preview)
+        cl.addWidget(self.txt_csv_preview)
+        btn_csv = QPushButton("Cargar otro CSV")
+        btn_csv.clicked.connect(self._load_csv)
+        cl.addWidget(btn_csv)
+        right.addWidget(grp_csv)
+
+        # Patterns folder
+        grp_pat = QGroupBox("Carpeta de Patrones")
+        pl = QVBoxLayout(grp_pat)
+        n_patterns = len([f for f in os.listdir(self.patterns_dir) if f.lower().endswith(('.png', '.jpg'))]) if os.path.isdir(self.patterns_dir) else 0
+        self.lbl_patterns = QLabel(f"📁 {self.patterns_dir}\n({n_patterns} imágenes)")
+        pl.addWidget(self.lbl_patterns)
+
+        # Grid preview
+        self.grid_widget = QWidget()
+        self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setSpacing(3)
+        self._update_pattern_grid()
+        pl.addWidget(self.grid_widget)
+
+        btn_pat = QPushButton("Seleccionar otra carpeta")
+        btn_pat.clicked.connect(self._select_patterns_dir)
+        pl.addWidget(btn_pat)
+        right.addWidget(grp_pat)
+
+        # Process button
+        self.btn_process = QPushButton("▶  PROCESAR")
+        self.btn_process.setObjectName("accentBtn")
+        self.btn_process.setFixedHeight(44)
+        self.btn_process.setStyleSheet(
+            "font-size: 15px; font-weight: bold; background-color: #a6e3a1; color: #1e1e2e; border:none; border-radius:6px;"
+        )
+        self.btn_process.clicked.connect(self._start_processing)
+        right.addWidget(self.btn_process)
+
+        right.addStretch()
+        lay.addLayout(right, stretch=1)
+        return w
+
+    def _update_pattern_grid(self):
+        # Clear
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not os.path.isdir(self.patterns_dir):
+            return
+        exts = (".png", ".jpg", ".jpeg")
+        files = sorted([f for f in os.listdir(self.patterns_dir) if f.lower().endswith(exts)])[:9]
+        for i, fname in enumerate(files):
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setFixedSize(60, 42)
+            lbl.setStyleSheet("border:1px solid #45475a; background:#181825; border-radius:3px;")
+            pix = QPixmap(os.path.join(self.patterns_dir, fname))
+            lbl.setPixmap(pix.scaled(56, 38, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            lbl.setToolTip(fname)
+            self.grid_layout.addWidget(lbl, i // 3, i % 3)
+
+    # -- Phase 2: Processing -----------------------------------------------
+    def _build_phase2(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        grp = QGroupBox("Progreso del Procesamiento")
+        gl = QVBoxLayout(grp)
+
+        self.lbl_stage = QLabel("Esperando...")
+        self.lbl_stage.setObjectName("phaseLabel")
+        gl.addWidget(self.lbl_stage)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        gl.addWidget(self.progress_bar)
+
+        self.lbl_progress_detail = QLabel("")
+        self.lbl_progress_detail.setObjectName("statusLabel")
+        gl.addWidget(self.lbl_progress_detail)
+
+        lay.addWidget(grp)
+
+        # Live log
+        grp_log = QGroupBox("Log de Procesamiento")
+        ll = QVBoxLayout(grp_log)
+        self.txt_log = QTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setStyleSheet("font-family: 'Consolas', monospace; font-size: 11px;")
+        ll.addWidget(self.txt_log)
+        lay.addWidget(grp_log)
+
+        return w
+
+    # -- Phase 3: Results --------------------------------------------------
+    def _build_phase3(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        # Top bar
+        top = QHBoxLayout()
+        self.lbl_result_summary = QLabel("")
+        self.lbl_result_summary.setObjectName("phaseLabel")
+        top.addWidget(self.lbl_result_summary)
+        top.addStretch()
+
+        btn_csv_exp = QPushButton("📄 Exportar CSV / SQL (MySQL)")
+        btn_csv_exp.setObjectName("accentBtn")
+        btn_csv_exp.setFixedHeight(34)
+        btn_csv_exp.clicked.connect(self._open_export_dialog)
+        top.addWidget(btn_csv_exp)
+        lay.addLayout(top)
+
+        splitter = QSplitter(Qt.Vertical)
+
+        # Inspector
+        grp_insp = QGroupBox("Inspector Visual")
+        il = QHBoxLayout(grp_insp)
+
+        # Extracted patch
+        f1 = QFrame()
+        f1.setFrameShape(QFrame.StyledPanel)
+        l1 = QVBoxLayout(f1)
+        l1.addWidget(QLabel("<b>Patrón Extraído</b>"), alignment=Qt.AlignCenter)
+        self.lbl_insp_patch = QLabel("—")
+        self.lbl_insp_patch.setAlignment(Qt.AlignCenter)
+        self.lbl_insp_patch.setFixedSize(120, 80)
+        self.lbl_insp_patch.setStyleSheet("border:1px solid #45475a; background:#181825;")
+        l1.addWidget(self.lbl_insp_patch, alignment=Qt.AlignCenter)
+        il.addWidget(f1)
+
+        # Info
+        f2 = QFrame()
+        f2.setFrameShape(QFrame.StyledPanel)
+        l2 = QVBoxLayout(f2)
+        l2.addWidget(QLabel("<b>Identificación</b>"), alignment=Qt.AlignCenter)
+        self.lbl_insp_info = QLabel("idLith: —\nNombre: —\nOCR: —")
+        self.lbl_insp_info.setAlignment(Qt.AlignCenter)
+        self.lbl_insp_info.setStyleSheet("font-size:12px; color:#a6e3a1;")
+        l2.addWidget(self.lbl_insp_info)
+        il.addWidget(f2)
+
+        # Matched pattern
+        f3 = QFrame()
+        f3.setFrameShape(QFrame.StyledPanel)
+        l3 = QVBoxLayout(f3)
+        l3.addWidget(QLabel("<b>Patrón Coincidente</b>"), alignment=Qt.AlignCenter)
+        self.lbl_insp_match = QLabel("—")
+        self.lbl_insp_match.setAlignment(Qt.AlignCenter)
+        self.lbl_insp_match.setFixedSize(120, 80)
+        self.lbl_insp_match.setStyleSheet("border:1px solid #45475a; background:#181825;")
+        l3.addWidget(self.lbl_insp_match, alignment=Qt.AlignCenter)
+        self.lbl_match_detail = QLabel("Archivo: —\nSimilitud: —")
+        self.lbl_match_detail.setAlignment(Qt.AlignCenter)
+        l3.addWidget(self.lbl_match_detail)
+        il.addWidget(f3)
+
+        splitter.addWidget(grp_insp)
+
+        # Table
+        self.table_results = QTableWidget()
+        self.table_results.setColumnCount(7)
+        self.table_results.setHorizontalHeaderLabels([
+            "id", "patternImage", "idLith", "idOperadora",
+            "Texto OCR", "Nombre Coincidente", "Similitud %",
+        ])
+        self.table_results.setAlternatingRowColors(True)
+        self.table_results.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_results.itemSelectionChanged.connect(self._on_result_row_changed)
+        splitter.addWidget(self.table_results)
+
+        splitter.setSizes([200, 400])
+        lay.addWidget(splitter)
+        return w
+
+    # -- Callbacks ---------------------------------------------------------
+    def _on_image_selected(self, path):
+        self.image_path = path
+        self.lbl_status.setText(f"Imagen cargada: {os.path.basename(path)}")
+
+    def _load_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Seleccionar CSV", "", "CSV (*.csv)")
+        if path:
+            self.geo_lith = load_geo_lith_csv(path)
+            self.lbl_csv_status.setText(f"✅ {len(self.geo_lith)} registros cargados desde {os.path.basename(path)}")
+
+    def _select_patterns_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de patrones")
+        if d:
+            self.patterns_dir = d
+            n = len([f for f in os.listdir(d) if f.lower().endswith(('.png', '.jpg'))])
+            self.lbl_patterns.setText(f"📁 {d}\n({n} imágenes)")
+            self._update_pattern_grid()
+
+    def _start_processing(self):
+        if not self.image_path:
+            QMessageBox.warning(self, "Falta imagen", "Cargá una imagen de referencias litológicas primero.")
+            return
+        if not self.geo_lith:
+            QMessageBox.warning(self, "Falta CSV", "No se encontró geo_lith.csv. Cargá un archivo CSV.")
+            return
+
+        self.stacked.setCurrentIndex(1)
+        self.phase_btns[1].setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.txt_log.clear()
+
+        self.worker = ProcessingWorker(
+            self.image_path,
+            self.geo_lith,
+            self.patterns_dir,
+            self.spn_operadora.value(),
+        )
+        self.worker.progress.connect(self._on_progress)
+        self.worker.stage_changed.connect(self._on_stage)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.error.connect(self._on_error)
+        self.worker.start()
+
+    def _on_progress(self, pct, msg):
+        self.progress_bar.setValue(pct)
+        self.lbl_progress_detail.setText(msg)
+        self.txt_log.append(f"[{pct:3d}%] {msg}")
+
+    def _on_stage(self, stage):
+        self.lbl_stage.setText(stage)
+        self.txt_log.append(f"\n{'='*50}\n  {stage}\n{'='*50}")
+
+    def _on_error(self, msg):
+        QMessageBox.critical(self, "Error", msg)
+        self.lbl_stage.setText("Error")
+        self.lbl_progress_detail.setText(msg)
+
+    def _on_finished(self, payload):
+        if isinstance(payload, dict) and "results" in payload:
+            results = payload["results"]
+            self.json_results = payload.get("json_results", [])
+        else:
+            results = payload
+            self.json_results = serialize_results_for_json(results)
+
+        self.results = results
+        self.phase_btns[2].setEnabled(True)
+        self.stacked.setCurrentIndex(2)
+
+        self.lbl_result_summary.setText(f"✅ {len(results)} elementos procesados")
+
+        self.table_results.setRowCount(len(results))
+        for i, r in enumerate(results):
+            self.table_results.setItem(i, 0, QTableWidgetItem(str(r["id"])))
+            self.table_results.setItem(i, 1, QTableWidgetItem(r["patternImage"]))
+            self.table_results.setItem(i, 2, QTableWidgetItem(str(r["idLith"])))
+            self.table_results.setItem(i, 3, QTableWidgetItem(str(r["idOperadora"])))
+            self.table_results.setItem(i, 4, QTableWidgetItem(r["ocr_text"]))
+            self.table_results.setItem(i, 5, QTableWidgetItem(r["matched_nombre"]))
+            self.table_results.setItem(i, 6, QTableWidgetItem(f"{r['pattern_score']:.1f}"))
+
+        if results:
+            self.table_results.selectRow(0)
+
+    def _on_result_row_changed(self):
+        row = self.table_results.currentRow()
+        if row < 0 or row >= len(self.results):
+            return
+        r = self.results[row]
+
+        # Show extracted patch
+        patch = r["patch"]
+        if patch is not None and patch.size > 0:
+            patch_c = np.ascontiguousarray(patch)
+            h, w, c = patch_c.shape
+            qimg = QImage(patch_c.data, w, h, c * w, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg).scaled(
+                self.lbl_insp_patch.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.lbl_insp_patch.setPixmap(pix)
+
+        self.lbl_insp_info.setText(
+            f"idLith: {r['idLith']}\n"
+            f"Nombre: {r['matched_nombre']}\n"
+            f"OCR: {r['ocr_text']}"
+        )
+
+        # Show matched pattern
+        if r["patternImage"]:
+            ppath = os.path.join(self.patterns_dir, r["patternImage"])
+            if os.path.isfile(ppath):
+                pix2 = QPixmap(ppath).scaled(
+                    self.lbl_insp_match.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                self.lbl_insp_match.setPixmap(pix2)
+            self.lbl_match_detail.setText(
+                f"Archivo: {r['patternImage']}\nSimilitud: {r['pattern_score']:.1f}%"
+            )
+        else:
+            self.lbl_insp_match.setText("—")
+            self.lbl_match_detail.setText("Sin coincidencia")
+
+    def _open_export_dialog(self):
+        if not self.results:
+            QMessageBox.warning(self, "Sin datos", "No hay resultados para exportar.")
+            return
+        dlg = ExportDialog(self.results, self)
+        dlg.exec()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyleSheet(DARK_STYLE)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
