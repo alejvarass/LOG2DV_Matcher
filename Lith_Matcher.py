@@ -385,7 +385,35 @@ def match_lith_name(ocr_text, geo_lith_records):
                 if ok_start and ok_end:
                     return geo_lith_records[i]["idLith"], geo_lith_records[i]["nombre"], 0.50
 
-    # --- 6) Fuzzy clásico de cadena completa (difflib), umbral alto para ---
+    # --- 6) Fuzzy de cadena + fallback por PRIMER token -------------------
+    # El primer token del OCR suele ser la litología principal y el resto
+    # adjetivos (color, textura): "CALIZA GRIS" -> CALIZA, "VULCANITA
+    # ROJIZA" -> VULCANITA. Esto es mucho más fiable que el fuzzy de cadena
+    # completa (que confunde "CALIZA GRIS" con "CALIZA GRAINSTONE").
+    # Solo se aplica si el primer token coincide exactamente con algún
+    # nombre del catálogo (o fuzzy >= 0.92).
+    if ocr_tokens:
+        first = ocr_tokens[0]
+        # 6a) primer token exacto = nombre completo del catálogo
+        for i, n in enumerate(names):
+            n_toks = _normalize_geo_text(n)
+            if n_toks and _fix_token(n_toks[0]) == first and len(n_toks) == 1:
+                return geo_lith_records[i]["idLith"], geo_lith_records[i]["nombre"], 0.55
+        # 6b) primer token exacto = primer token de un nombre (el más corto)
+        best6, best6_idx = 10**9, -1
+        for i, n in enumerate(names):
+            n_toks = [_fix_token(t) for t in _normalize_geo_text(n)]
+            if n_toks and n_toks[0] == first and len(n_toks) < best6:
+                best6, best6_idx = len(n_toks), i
+        if best6_idx >= 0:
+            return geo_lith_records[best6_idx]["idLith"], geo_lith_records[best6_idx]["nombre"], 0.50
+        # 6c) primer token fuzzy alto contra primer token del catálogo
+        for i, n in enumerate(names):
+            n_toks = [_fix_token(t) for t in _normalize_geo_text(n)]
+            if n_toks and SequenceMatcher(None, n_toks[0], first).ratio() >= 0.92:
+                return geo_lith_records[i]["idLith"], geo_lith_records[i]["nombre"], 0.45
+
+    # --- 7) Fuzzy clásico de cadena completa (difflib), umbral alto para ---
     # --- no asignar litologías a texto que claramente no es geológico.   ---
     # Se exige además que la longitud no difiera demasiado (evita que
     # "ARENA" (5) case con "AREN" (4) por ratio 0.889).
