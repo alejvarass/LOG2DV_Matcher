@@ -3,3 +3,7 @@ opencv-python-headless>=4.8
 numpy>=1.24
 Pillow>=10.0
 easyocr>=1.7
+# Drivers opcionales para el modo "Base de Datos Remota":
+# instalar solo el que corresponda al motor elegido.
+# pymysql>=1.1
+# psycopg2-binary>=2.9
