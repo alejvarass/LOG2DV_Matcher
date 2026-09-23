@@ -24,6 +24,14 @@ import os
 import csv
 import hashlib
 import unicodedata
+
+# --- Forzar CPU antes de importar torch/easyocr ---------------------------
+# Las placas AMD (p.ej. Radeon R7 M440) NO soportan CUDA: si torch/easyocr
+# detectan una GPU e intentan usarla, lanzan errores (cudnn/cublas) o se
+# cuelgan. Vaciar CUDA_VISIBLE_DEVICES hace que todo corra en CPU, que es
+# el modo soportado por esta aplicación.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import cv2
 import numpy as np
 import easyocr
@@ -946,7 +954,16 @@ class ProcessingWorker(QThread):
 
         self.stage_changed.emit("Etapa 2: Reconocimiento OCR de etiquetas")
         self.progress.emit(25, "Iniciando EasyOCR...")
-        reader = easyocr.Reader(["es", "en"], gpu=False, verbose=False)
+        # gpu=False explícito: la app corre en CPU. En placas AMD (sin CUDA)
+        # easyocr/torch pueden lanzar errores si detectan una GPU; además se
+        # vació CUDA_VISIBLE_DEVICES al importar, como doble protección.
+        try:
+            reader = easyocr.Reader(["es", "en"], gpu=False, verbose=False)
+        except Exception:
+            # Algunas versiones de easyocr aún intentan inicializar CUDA:
+            # reintenta con el flag de torch apagado por si acaso.
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            reader = easyocr.Reader(["es", "en"], gpu=False, verbose=False)
 
         segments = []
         total = len(boxes)
@@ -1807,6 +1824,9 @@ class MainWindow(QMainWindow):
         ExportDialog(self.results, self).exec()
 
 if __name__ == "__main__":
+    # Render por software: evita errores de drivers OpenGL en placas AMD
+    # antiguas (p.ej. Radeon R7 M440), que a veces fallan con aceleración.
+    QApplication.setAttribute(Qt.AA_UseSoftwareOpenGL, True)
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLE)
     # Ventana inicial: elegir origen de datos (local / base de datos remota).
