@@ -57,6 +57,95 @@ DEFAULT_PATTERNS_DIR = os.path.join(BASE_DIR, "Patterns")
 PATTERN_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
 
 # ============================================================================
+# CONEXIÓN A BASE DE DATOS REMOTA (MySQL / PostgreSQL)
+# ============================================================================
+# Los drivers son OPCIONALES: si no están instalados, el modo remoto informa
+# del problema y la app sigue funcionando en modo local (CSV).
+try:
+    import pymysql
+    PYMYSQL_AVAILABLE = True
+except Exception:
+    pymysql = None
+    PYMYSQL_AVAILABLE = False
+
+try:
+    import psycopg2
+    PSYCOPG2_AVAILABLE = True
+except Exception:
+    psycopg2 = None
+    PSYCOPG2_AVAILABLE = False
+
+def load_geo_lith_db(engine, host, port, user, password, database):
+    """
+    Carga la tabla geo_lith desde una base de datos remota.
+
+    Parámetros: engine ("mysql" | "postgresql"), host, port, user, password
+    y nombre de la base de datos. Devuelve la misma estructura que
+    load_geo_lith_csv: [{"idLith": int, "nombre": str}, ...].
+
+    Lanza RuntimeError con mensaje claro si falta el driver o falla la
+    conexión: la interfaz lo captura y ofrece continuar en modo local.
+    """
+    if engine == "mysql":
+        if not PYMYSQL_AVAILABLE:
+            raise RuntimeError("Falta el driver MySQL: pip install pymysql")
+        conn = pymysql.connect(host=host, port=int(port), user=user,
+                               password=password, database=database,
+                               connect_timeout=8, charset="utf8mb4")
+    else:
+        if not PSYCOPG2_AVAILABLE:
+            raise RuntimeError("Falta el driver PostgreSQL: pip install psycopg2-binary")
+        conn = psycopg2.connect(host=host, port=int(port), user=user,
+                                password=password, dbname=database,
+                                connect_timeout=8)
+    try:
+        cur = conn.cursor()
+        # Selección explícita de columnas: no depende del orden físico
+        cur.execute('SELECT "idLith", "nombre" FROM geo_lith' if engine == "postgresql"
+                    else "SELECT `idLith`, `nombre` FROM geo_lith")
+        records = []
+        for row in cur.fetchall():
+            try:
+                records.append({"idLith": int(row[0]), "nombre": str(row[1])})
+            except (TypeError, ValueError):
+                continue
+        return records
+    finally:
+        conn.close()
+
+def load_operadoras_db(engine, host, port, user, password, database):
+    """
+    Carga la tabla operadoras (id, nombre) desde la BD remota.
+    Devuelve [] si la tabla no existe todavía: es un catálogo auxiliar
+    que se afinará más adelante.
+    """
+    if engine == "mysql":
+        if not PYMYSQL_AVAILABLE:
+            return []
+        conn = pymysql.connect(host=host, port=int(port), user=user,
+                               password=password, database=database,
+                               connect_timeout=8, charset="utf8mb4")
+        sql = "SHOW TABLES LIKE 'operadoras'"
+    else:
+        if not PSYCOPG2_AVAILABLE:
+            return []
+        conn = psycopg2.connect(host=host, port=int(port), user=user,
+                                password=password, dbname=database,
+                                connect_timeout=8)
+        sql = "SELECT tablename FROM pg_tables WHERE tablename = 'operadoras'"
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        if not cur.fetchall():
+            return []
+        cur.execute("SELECT id, nombre FROM operadoras")
+        return [{"id": int(r[0]), "nombre": str(r[1])} for r in cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+# ============================================================================
 # CONFIGURACIÓN DEL MOTOR DE COMPARACIÓN
 # ============================================================================
 
@@ -1128,17 +1217,155 @@ class DropImageZone(QLabel):
         self.setPixmap(pix)
         self.imageSelected.emit(path)
 
+class DataSourceDialog(QDialog):
+    """
+    Ventana inicial: elige el origen de datos de trabajo.
+
+      - "Datos locales": usa geo_lith.csv y la carpeta Patterns (flujo actual).
+      - "Base de datos remota": conecta con MySQL/PostgreSQL y carga las
+        tablas del catálogo (geo_lith, operadoras, ...) desde el servidor.
+
+    Si se elige remota, se piden servidor, puerto, usuario, contraseña,
+    motor (desplegable) y nombre de la base de datos, y se prueba la
+    conexión antes de continuar. En caso de fallo se puede cancelar y
+    volver a local.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Origen de Datos")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+        # Resultado: dict con mode="local" o mode="remote" + parámetros
+        self.result = {"mode": "local"}
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("<b>¿Cómo querés trabajar?</b>"))
+
+        # --- Dos botones grandes de elección ---
+        btns = QHBoxLayout()
+        self.btn_local = QPushButton("📁  Datos Locales\n(CSV + carpeta Patterns)")
+        self.btn_remote = QPushButton("🌐  Base de Datos Remota\n(MySQL / PostgreSQL)")
+        for b in (self.btn_local, self.btn_remote):
+            b.setFixedHeight(56)
+            btns.addWidget(b)
+        lay.addLayout(btns)
+
+        # --- Formulario de conexión (solo activo en modo remoto) ---
+        self.grp_conn = QGroupBox("Conexión a Base de Datos")
+        form = QFormLayout(self.grp_conn)
+        self.cmb_engine = QComboBox()
+        self.cmb_engine.addItems(["MySQL", "PostgreSQL"])
+        self.txt_host = QLineEdit("localhost")
+        self.spn_port = QSpinBox()
+        self.spn_port.setRange(1, 65535)
+        self.spn_port.setValue(3306)
+        self.txt_user = QLineEdit()
+        self.txt_pass = QLineEdit()
+        self.txt_pass.setEchoMode(QLineEdit.Password)
+        self.txt_dbname = QLineEdit("geologia")
+        form.addRow("Motor:", self.cmb_engine)
+        form.addRow("Servidor:", self.txt_host)
+        form.addRow("Puerto:", self.spn_port)
+        form.addRow("Usuario:", self.txt_user)
+        form.addRow("Contraseña:", self.txt_pass)
+        form.addRow("Base de datos:", self.txt_dbname)
+        self.grp_conn.setEnabled(False)   # solo con foco remoto
+        lay.addWidget(self.grp_conn)
+
+        self.lbl_info = QLabel("Modo local: se usará geo_lith.csv y la carpeta Patterns.")
+        self.lbl_info.setWordWrap(True)
+        lay.addWidget(self.lbl_info)
+
+        ok = QPushButton("Continuar")
+        ok.setObjectName("accentBtn")
+        ok.setFixedHeight(36)
+        ok.clicked.connect(self._accept)
+        lay.addWidget(ok)
+
+        self.btn_local.clicked.connect(self._pick_local)
+        self.btn_remote.clicked.connect(self._pick_remote)
+        # Puerto por defecto según motor elegido
+        self.cmb_engine.currentIndexChanged.connect(self._on_engine_changed)
+        self._mode = "local"
+
+    def _on_engine_changed(self, idx):
+        # 3306 MySQL / 5432 PostgreSQL
+        self.spn_port.setValue(3306 if idx == 0 else 5432)
+
+    def _pick_local(self):
+        self._mode = "local"
+        self.grp_conn.setEnabled(False)
+        self.lbl_info.setText("Modo local: se usará geo_lith.csv y la carpeta Patterns.")
+
+    def _pick_remote(self):
+        self._mode = "remote"
+        self.grp_conn.setEnabled(True)   # el bloque toma foco
+        self.lbl_info.setText("Modo remoto: completá los datos de conexión y presioná Continuar.")
+        self.txt_host.setFocus()
+
+    def _accept(self):
+        if self._mode == "local":
+            self.result = {"mode": "local"}
+            self.accept()
+            return
+        # --- Validación mínima del formulario remoto ---
+        host = self.txt_host.text().strip()
+        user = self.txt_user.text().strip()
+        dbname = self.txt_dbname.text().strip()
+        if not host or not user or not dbname:
+            QMessageBox.warning(self, "Atención", "Completá servidor, usuario y base de datos.")
+            return
+        engine = "mysql" if self.cmb_engine.currentIndex() == 0 else "postgresql"
+        params = {
+            "mode": "remote", "engine": engine, "host": host,
+            "port": self.spn_port.value(), "user": user,
+            "password": self.txt_pass.text(), "database": dbname,
+        }
+        # --- Prueba de conexión antes de aceptar ---
+        try:
+            recs = load_geo_lith_db(engine, host, params["port"], user,
+                                    params["password"], dbname)
+            params["geo_lith_count"] = len(recs)
+        except Exception as e:
+            QMessageBox.critical(self, "Error de conexión", str(e))
+            return
+        self.result = params
+        self.accept()
+
+
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, data_source=None):
         super().__init__()
         self.setWindowTitle("Lith Analizador Litológico")
         self.resize(1340, 800)
 
         self.image_path = None
-        self.geo_lith = load_geo_lith_csv(DEFAULT_CSV_PATH)
         self.patterns_dir = DEFAULT_PATTERNS_DIR
         self.results = []
         self.worker = None
+        # Configuración del origen de datos elegido en la ventana inicial
+        self.data_source = data_source or {"mode": "local"}
+        self.db_config = None
+        self.operadoras = []
+
+        # --- Carga inicial del catálogo geo_lith según el origen elegido ---
+        if self.data_source.get("mode") == "remote":
+            p = self.data_source
+            try:
+                self.geo_lith = load_geo_lith_db(p["engine"], p["host"], p["port"],
+                                                 p["user"], p["password"], p["database"])
+                self.db_config = p
+                # Tabla auxiliar de operadoras (si existe; se afinará luego)
+                self.operadoras = load_operadoras_db(p["engine"], p["host"], p["port"],
+                                                     p["user"], p["password"], p["database"])
+            except Exception as e:
+                QMessageBox.critical(self, "Error de conexión",
+                                     f"No se pudo cargar geo_lith desde la BD.\n{e}\n\nSe continúa en modo local.")
+                self.data_source = {"mode": "local"}
+                self.geo_lith = load_geo_lith_csv(DEFAULT_CSV_PATH)
+        else:
+            self.geo_lith = load_geo_lith_csv(DEFAULT_CSV_PATH)
 
         self._build_ui()
 
@@ -1174,6 +1401,47 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(w)
 
         left = QVBoxLayout()
+
+        # --- Bloque de conexión remota (encima del bloque de imagen) ------
+        # Solo toma foco (editable) cuando se trabaja en modo remoto.
+        # En modo local queda visible pero deshabilitado, como referencia.
+        self.grp_remote = QGroupBox("Base de Datos Remota")
+        self.grp_remote.setCheckable(True)
+        rl = QFormLayout(self.grp_remote)
+        self.cmb_engine_main = QComboBox()
+        self.cmb_engine_main.addItems(["MySQL", "PostgreSQL"])
+        self.txt_host_main = QLineEdit()
+        self.spn_port_main = QSpinBox()
+        self.spn_port_main.setRange(1, 65535)
+        self.txt_user_main = QLineEdit()
+        self.txt_pass_main = QLineEdit()
+        self.txt_pass_main.setEchoMode(QLineEdit.Password)
+        self.txt_dbname_main = QLineEdit()
+        rl.addRow("Motor:", self.cmb_engine_main)
+        rl.addRow("Servidor:", self.txt_host_main)
+        rl.addRow("Puerto:", self.spn_port_main)
+        rl.addRow("Usuario:", self.txt_user_main)
+        rl.addRow("Contraseña:", self.txt_pass_main)
+        rl.addRow("Base de datos:", self.txt_dbname_main)
+        self.cmb_engine_main.currentIndexChanged.connect(
+            lambda idx: self.spn_port_main.setValue(3306 if idx == 0 else 5432))
+
+        # Precargar con la elección de la ventana inicial
+        is_remote = self.data_source.get("mode") == "remote"
+        self.grp_remote.setChecked(is_remote)
+        self.grp_remote.setEnabled(is_remote)
+        if is_remote:
+            p = self.data_source
+            self.cmb_engine_main.setCurrentIndex(0 if p["engine"] == "mysql" else 1)
+            self.txt_host_main.setText(p["host"])
+            self.spn_port_main.setValue(p["port"])
+            self.txt_user_main.setText(p["user"])
+            self.txt_pass_main.setText(p["password"])
+            self.txt_dbname_main.setText(p["database"])
+        # Cambiar de modo desde la propia fase 1
+        self.grp_remote.toggled.connect(self._on_remote_toggled)
+        left.addWidget(self.grp_remote)
+
         grp_img = QGroupBox("Imagen de Referencias Litológicas")
         gl = QVBoxLayout(grp_img)
         self.drop_zone = DropImageZone()
@@ -1344,6 +1612,41 @@ class MainWindow(QMainWindow):
         self.image_path = p
         self.lbl_status.setText(f"Imagen seleccionada: {os.path.basename(p)}")
 
+    def _on_remote_toggled(self, checked):
+        """
+        Activa/desactiva el modo remoto desde la fase 1.
+        Al activarse, intenta conectar y recargar geo_lith/operadoras desde
+        la BD; si falla, avisa y vuelve a local sin romper el flujo.
+        """
+        self.grp_remote.setEnabled(checked)
+        if not checked:
+            self.data_source = {"mode": "local"}
+            self.geo_lith = load_geo_lith_csv(DEFAULT_CSV_PATH)
+            self.db_config = None
+            self.lbl_csv_status.setText(
+                f"✅ {len(self.geo_lith)} registros cargados (local)" if self.geo_lith else "❌ No encontrado")
+            return
+        engine = "mysql" if self.cmb_engine_main.currentIndex() == 0 else "postgresql"
+        host = self.txt_host_main.text().strip()
+        port = self.spn_port_main.value()
+        user = self.txt_user_main.text().strip()
+        pwd = self.txt_pass_main.text()
+        dbname = self.txt_dbname_main.text().strip()
+        if not host or not user or not dbname:
+            self.lbl_csv_status.setText("⚠️ Completá servidor, usuario y base de datos")
+            return
+        try:
+            recs = load_geo_lith_db(engine, host, port, user, pwd, dbname)
+            self.geo_lith = recs
+            self.db_config = {"engine": engine, "host": host, "port": port,
+                              "user": user, "password": pwd, "database": dbname}
+            self.data_source = {"mode": "remote", **self.db_config}
+            self.operadoras = load_operadoras_db(engine, host, port, user, pwd, dbname)
+            self.lbl_csv_status.setText(f"✅ {len(recs)} registros desde BD remota ({dbname})")
+        except Exception as e:
+            self.lbl_csv_status.setText(f"❌ Error BD: {e}")
+            QMessageBox.critical(self, "Error de conexión", str(e))
+
     def _load_csv(self):
         p, _ = QFileDialog.getOpenFileName(self, "Seleccionar geo_lith.csv", "", "CSV (*.csv)")
         if p:
@@ -1478,6 +1781,10 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLE)
-    win = MainWindow()
+    # Ventana inicial: elegir origen de datos (local / base de datos remota).
+    # Si el usuario cierra la ventana sin elegir, se trabaja en modo local.
+    dlg = DataSourceDialog()
+    dlg.exec()
+    win = MainWindow(data_source=dlg.result)
     win.show()
     sys.exit(app.exec())
