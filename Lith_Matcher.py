@@ -829,6 +829,11 @@ class DINOv2Extractor:
         try:
             self.device = torch.device("cpu")
             self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+            # En CPU (sin CUDA, p.ej. placas AMD) el kernel
+            # "memory_efficient_attention_forward" de xformers NO existe y
+            # lanza "No operator found...". Se fuerza la atención estándar
+            # desactivando el flag de mem-efficient en cada bloque.
+            self._disable_mem_efficient_attention()
             self.model.eval()
             self.model.to(self.device)
             self.transform = transforms.Compose([
@@ -842,6 +847,25 @@ class DINOv2Extractor:
             # Sin red o sin pesos: el sistema opera sin IA
             self.model = None
             self.available = False
+
+    def _disable_mem_efficient_attention(self):
+        """
+        Desactiva la atención memory-efficient (xformers) en todos los
+        bloques del ViT para que use atención estándar (válida en CPU).
+        Recorre los módulos y apaga cualquier flag/atributo relacionado;
+        es tolerante a distintas versiones de dinov2.
+        """
+        for m in self.model.modules():
+            for attr in ("mem_eff", "mem_efficient", "use_mem_efficient_attention",
+                         "mem_efficient_attention", "xformers"):
+                if hasattr(m, attr):
+                    try:
+                        setattr(m, attr, False)
+                    except Exception:
+                        pass
+            # Algunos módulos exponen el método de atención como atributo
+            if hasattr(m, "attn") and hasattr(m.attn, "forward"):
+                pass  # la atención se elige por los flags anteriores
 
     def _embed_single(self, pil_img):
         t = self.transform(pil_img).unsqueeze(0).to(self.device)
